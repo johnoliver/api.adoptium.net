@@ -30,6 +30,7 @@ class V3Updater @Inject constructor(
 ) {
 
     private val mutex = Mutex()
+    private val incrementalUpdateMutex = Mutex()
 
     companion object {
         @JvmStatic
@@ -54,20 +55,28 @@ class V3Updater @Inject constructor(
 
     fun incrementalUpdate(oldRepo: AdoptRepos): AdoptRepos? {
         return runBlocking {
-            // Must catch errors or may kill the scheduler
-            try {
-                LOGGER.info("Starting Incremental update")
-                val updatedRepo = adoptReposBuilder.incrementalUpdate(oldRepo)
-
-                if (updatedRepo != oldRepo) {
-                    val after = writeIncrementalUpdate(updatedRepo, oldRepo)
-                    printRepoDebugInfo(oldRepo, updatedRepo, after)
-                    return@runBlocking after
-                }
-            } catch (e: Exception) {
-                LOGGER.error("Failed to perform incremental update", e)
+            if (incrementalUpdateMutex.isLocked) {
+                LOGGER.warn("Multiple concurrent incremental updates attempted")
+                return@runBlocking null
             }
-            return@runBlocking null
+
+            return@runBlocking incrementalUpdateMutex
+                .withLock {
+                    // Must catch errors or may kill the scheduler
+                    try {
+                        LOGGER.info("Starting Incremental update")
+                        val updatedRepo = adoptReposBuilder.incrementalUpdate(oldRepo)
+
+                        if (updatedRepo != oldRepo) {
+                            val after = writeIncrementalUpdate(updatedRepo, oldRepo)
+                            printRepoDebugInfo(oldRepo, updatedRepo, after)
+                            return@runBlocking after
+                        }
+                    } catch (e: Exception) {
+                        LOGGER.error("Failed to perform incremental update", e)
+                    }
+                    return@withLock null
+                }
         }
     }
 
