@@ -5,11 +5,11 @@ import org.eclipse.microprofile.openapi.annotations.media.Schema
 
 @Schema(
     type = SchemaType.STRING,
-    defaultValue = AdoptVendor.DEFAULT_VALUE,
+    defaultValue = AdoptiumVendor.DEFAULT_VALUE,
     enumeration = ["adoptopenjdk", "openjdk", "eclipse", "alibaba", "ibm"],
     example = "adoptopenjdk"
 )
-class AdoptVendor {
+class AdoptiumVendor {
     companion object {
         const val DEFAULT_VALUE = "adoptopenjdk"
 
