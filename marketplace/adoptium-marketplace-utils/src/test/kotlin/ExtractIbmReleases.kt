@@ -1,33 +1,67 @@
+import com.fasterxml.jackson.core.JsonParser
+import com.fasterxml.jackson.databind.DeserializationContext
+import com.fasterxml.jackson.databind.JsonDeserializer
+import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.readValue
 import net.adoptium.api.v3.JsonMapper
 import net.adoptium.api.v3.models.Release
 import net.adoptium.marketplace.client.MarketplaceMapper
 import net.adoptium.marketplace.schema.*
 import org.eclipse.jetty.client.HttpClient
+import org.junit.jupiter.api.AfterEach
+import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import java.io.File
 import java.io.FileWriter
-import java.io.StringReader
-import java.io.StringWriter
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.Paths
 import java.util.*
-import javax.json.Json
 import kotlin.io.path.absolutePathString
 
 class ExtractIbmReleases {
+
+    private lateinit var httpClient: HttpClient
+    private lateinit var mapper: ObjectMapper
 
     companion object {
         val VERSIONS = listOf(8, 11, 17)
     }
 
+    @BeforeEach
+    fun setup() {
+        mapper = createMapper()
+
+        httpClient = HttpClient()
+        httpClient.isFollowRedirects = true
+        httpClient.start()
+    }
+
+    @AfterEach
+    fun shutdown() {
+        httpClient.stop()
+    }
+
+    // Creates an object mapper that ignores the Vendor value. Required as the IBM api uses a vendor that we do not have in our models
+    private fun createMapper(): ObjectMapper {
+        // For this test ignore value and just return a vendor
+        return JsonMapper.mapper.registerModule(object : com.fasterxml.jackson.databind.module.SimpleModule() {
+            override fun setupModule(context: SetupContext?) {
+                addDeserializer(net.adoptium.api.v3.models.Vendor::class.java, object : JsonDeserializer<net.adoptium.api.v3.models.Vendor>() {
+                    override fun deserialize(p0: JsonParser?, p1: DeserializationContext?): net.adoptium.api.v3.models.Vendor {
+
+                        // Ignore value and return adoptium
+                        return net.adoptium.api.v3.models.Vendor.adoptium
+                    }
+                })
+                super.setupModule(context)
+            }
+        })
+    }
+
     //@Disabled("For manual execution")
     @Test
     fun buildSemeruRepo() {
-        val httpClient = HttpClient()
-        httpClient.isFollowRedirects = true
-        httpClient.start()
 
         val dir = Files.createTempDirectory("repo")
 
@@ -37,28 +71,26 @@ class ExtractIbmReleases {
         // Only doing LTS for now
         VERSIONS
             .map { version ->
-                buildRepoForVersion(dir, version, httpClient)
+                buildRepoForVersion(dir, version)
             }
-        httpClient.stop()
 
         println("Repo created at ${dir.absolutePathString()}")
     }
 
     private fun buildRepoForVersion(
         dir: Path,
-        version: Int,
-        httpClient: HttpClient
+        version: Int
     ) {
         // Get directory to write to, i.e `./8/`
         val versionDir = Path.of(dir.toFile().absolutePath, "$version").toFile()
         versionDir.mkdirs()
 
         // Get non-certified editions
-        val semeruReleases = getIbmReleases(httpClient, "ibm", version)
+        val semeruReleases = getIbmReleases("ibm", version)
         val semeruMarketplaceReleases = convertToMarketplaceSchema(Distribution.semeru, semeruReleases)
 
         // Get certified editions
-        val semeruCeReleases = getIbmReleases(httpClient, "ibm_ce", version)
+        val semeruCeReleases = getIbmReleases("ibm_ce", version)
         val semeruCeMarketplaceReleases = convertToMarketplaceSchema(Distribution.semeru_ce, semeruCeReleases)
 
         // Merge lists
@@ -127,7 +159,7 @@ class ExtractIbmReleases {
         return marketplaceReleases
     }
 
-    private fun getIbmReleases(httpClient: HttpClient, vendorName: String, version: Int): List<Release> {
+    private fun getIbmReleases(vendorName: String, version: Int): List<Release> {
         // Possibly might need to check next page...one day
         val response = httpClient.GET("https://ibm.com/semeru-runtimes/api/v3/assets/feature_releases/${version}/ga?vendor=${vendorName}&page_size=100")
 
@@ -136,48 +168,7 @@ class ExtractIbmReleases {
             return emptyList()
         }
 
-        val fixedData = fixVendorValue(response.contentAsString)
-
-        return JsonMapper.mapper.readValue(fixedData)
-    }
-
-    /**
-     * Since we dont have the IBM vendor values substitute them out for one we do have, so we can deserialize them using adoptium models
-     */
-    private fun fixVendorValue(data: String): String {
-        return StringWriter().use { releaseListWriter ->
-
-            Json.createWriter(releaseListWriter).use { releaseListJsonWriter ->
-
-                // Parse JSON and substitute out the vendor value
-                Json.createReader(StringReader(data)).use { reader ->
-                    val releases = reader.readArray()
-
-                    // Since IBM have a vendor we cannot deserialize, temporarily substitute one we do have
-                    // Select a vendor to use
-                    val tmpVendor = net.adoptium.api.v3.models.Vendor.VALID_VENDORS.toList()[0].name
-
-                    val releaseArrayBuilder = Json.createArrayBuilder()
-                    releases
-                        .map { release -> release.asJsonObject() }
-                        .map {
-                            // Replace vendor value in the json
-                            val builder = Json.createObjectBuilder()
-                            val entries = it.toMutableMap()
-                            entries.replace("vendor", Json.createValue(tmpVendor))
-                            entries
-                                .entries
-                                .forEach { k -> builder.add(k.key, k.value) }
-                            builder.build()
-                        }
-                        .forEach { releaseArrayBuilder.add(it) }
-
-                    releaseListJsonWriter.writeArray(releaseArrayBuilder.build())
-                }
-            }
-
-            releaseListWriter.buffer.toString()
-        }
+        return mapper.readValue(response.content)
     }
 
     private fun toFileName(it: net.adoptium.marketplace.schema.Release) = it
