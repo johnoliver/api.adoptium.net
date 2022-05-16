@@ -88,37 +88,57 @@ class ExtractIbmReleases {
         // Get non-certified editions
         val semeruReleases = getIbmReleases("ibm", version)
         val semeruMarketplaceReleases = convertToMarketplaceSchema(Distribution.semeru, semeruReleases)
+        val semeruFileNames = writeReleasesToFiles(Distribution.semeru, semeruMarketplaceReleases, versionDir)
 
         // Get certified editions
         val semeruCeReleases = getIbmReleases("ibm_ce", version)
         val semeruCeMarketplaceReleases = convertToMarketplaceSchema(Distribution.semeru_ce, semeruCeReleases)
+        val semeruCeFileNames = writeReleasesToFiles(Distribution.semeru_ce, semeruCeMarketplaceReleases, versionDir)
 
         // Merge lists
-        val marketplaceReleases = semeruMarketplaceReleases.plus(semeruCeMarketplaceReleases)
+        val fileNames = semeruFileNames.plus(semeruCeFileNames)
+
 
         // Create index file
-        createIndexFile(marketplaceReleases, versionDir)
+        createIndexFile(fileNames, versionDir)
+    }
 
+    private fun writeReleasesToFiles(distribution: Distribution, marketplaceReleases: List<ReleaseList>, versionDir: File): List<String> {
         // Write all releases to file
-        marketplaceReleases
-            .forEach { release ->
-                // write to file, i.e ./8/jdk8u302_b08.json
-                val fos = FileWriter(Paths.get(versionDir.absolutePath, toFileName(release.releases.first())).toFile())
+        return marketplaceReleases
+            .map { release ->
+
+                // Search for an index that has not been used, required as there are multiple releases with the same release name and we dont
+                // want them to overwrite the same file
+                val file = (0..100).firstNotNullOf { index ->
+                    val fileName = toFileName(distribution, release.releases.first(), index)
+                    // write to file, i.e ./8/jdk8u302_b08.json
+                    val file = Paths.get(versionDir.absolutePath, fileName).toFile()
+
+                    return@firstNotNullOf if (file.exists()) {
+                        null
+                    } else {
+                        file
+                    }
+                }
+
+                val fos = FileWriter(file)
 
                 // Serialize object to file
                 fos.use {
                     it.write(MarketplaceMapper.repositoryObjectMapper.writeValueAsString(release))
                 }
+
+                file.name
             }
     }
 
-    private fun createIndexFile(marketplaceReleases: List<ReleaseList>, versionDir: File) {
+    private fun createIndexFile(fileNames: List<String>, versionDir: File) {
         // Create index file i.e './8/index.json
         val indexFile = IndexFile(
             IndexFile.LATEST_VERSION,
             emptyList(),
-            marketplaceReleases
-                .map { toFileName(it.releases.first()) }
+            fileNames
         )
         val indexfw = FileWriter(Paths.get(versionDir.absolutePath, "index.json").toFile())
         indexfw.use {
@@ -171,12 +191,13 @@ class ExtractIbmReleases {
         return mapper.readValue(response.content)
     }
 
-    private fun toFileName(it: net.adoptium.marketplace.schema.Release) = it
-        .releaseName
-        .replace("+", "_")
-        .replace(".", "_")
-        .replace("-", "_")
-        .plus(".json")
+    private fun toFileName(distribution: Distribution, release: net.adoptium.marketplace.schema.Release, index: Int) = distribution.name + "_" +
+        release
+            .releaseName
+            .replace("+", "_")
+            .replace(".", "_")
+            .replace("-", "_")
+            .plus("_$index.json")
 
 
     private fun toMarketplaceRelease(release: Release, binaries: List<Binary>): net.adoptium.marketplace.schema.Release {
