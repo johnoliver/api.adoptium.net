@@ -85,25 +85,16 @@ class ExtractIbmReleases {
         val versionDir = Path.of(dir.toFile().absolutePath, "$version").toFile()
         versionDir.mkdirs()
 
-        // Get non-certified editions
-        val semeruReleases = getIbmReleases("ibm", version)
-        val semeruMarketplaceReleases = convertToMarketplaceSchema(Distribution.semeru, semeruReleases)
-        val semeruFileNames = writeReleasesToFiles(Distribution.semeru, semeruMarketplaceReleases, versionDir)
-
         // Get certified editions
         val semeruCeReleases = getIbmReleases("ibm_ce", version)
-        val semeruCeMarketplaceReleases = convertToMarketplaceSchema(Distribution.semeru_ce, semeruCeReleases)
-        val semeruCeFileNames = writeReleasesToFiles(Distribution.semeru_ce, semeruCeMarketplaceReleases, versionDir)
-
-        // Merge lists
-        val fileNames = semeruFileNames.plus(semeruCeFileNames)
-
+        val semeruCeMarketplaceReleases = convertToMarketplaceSchema(semeruCeReleases)
+        val semeruCeFileNames = writeReleasesToFiles(semeruCeMarketplaceReleases, versionDir)
 
         // Create index file
-        createIndexFile(fileNames, versionDir)
+        createIndexFile(semeruCeFileNames, versionDir)
     }
 
-    private fun writeReleasesToFiles(distribution: Distribution, marketplaceReleases: List<ReleaseList>, versionDir: File): List<String> {
+    private fun writeReleasesToFiles(marketplaceReleases: List<ReleaseList>, versionDir: File): List<String> {
         // Write all releases to file
         return marketplaceReleases
             .map { release ->
@@ -111,7 +102,7 @@ class ExtractIbmReleases {
                 // Search for an index that has not been used, required as there are multiple releases with the same release name and we dont
                 // want them to overwrite the same file
                 val file = (0..100).firstNotNullOf { index ->
-                    val fileName = toFileName(distribution, release.releases.first(), index)
+                    val fileName = toFileName(release.releases.first(), index)
                     // write to file, i.e ./8/jdk8u302_b08.json
                     val file = Paths.get(versionDir.absolutePath, fileName).toFile()
 
@@ -170,10 +161,10 @@ class ExtractIbmReleases {
         }
     }
 
-    private fun convertToMarketplaceSchema(distribution: Distribution, releases: List<Release>): List<ReleaseList> {
+    private fun convertToMarketplaceSchema(releases: List<Release>): List<ReleaseList> {
         val marketplaceReleases = releases
             .map { release ->
-                ReleaseList(listOf(toMarketplaceRelease(release, toMarketplaceBinaries(distribution, release))))
+                ReleaseList(listOf(toMarketplaceRelease(release, toMarketplaceBinaries(release))))
             }
             .toList()
         return marketplaceReleases
@@ -191,13 +182,12 @@ class ExtractIbmReleases {
         return mapper.readValue(response.content)
     }
 
-    private fun toFileName(distribution: Distribution, release: net.adoptium.marketplace.schema.Release, index: Int) = distribution.name + "_" +
-        release
-            .releaseName
-            .replace("+", "_")
-            .replace(".", "_")
-            .replace("-", "_")
-            .plus("_$index.json")
+    private fun toFileName(release: net.adoptium.marketplace.schema.Release, index: Int) = release
+        .releaseName
+        .replace("+", "_")
+        .replace(".", "_")
+        .replace("-", "_")
+        .plus("_$index.json")
 
 
     private fun toMarketplaceRelease(release: Release, binaries: List<Binary>): net.adoptium.marketplace.schema.Release {
@@ -227,7 +217,7 @@ class ExtractIbmReleases {
         )
     }
 
-    private fun toMarketplaceBinaries(distribution: Distribution, release: Release) = release
+    private fun toMarketplaceBinaries(release: Release) = release
         .binaries
         .map { binary ->
             val arch = if (binary.os == net.adoptium.api.v3.models.OperatingSystem.`alpine-linux`) {
@@ -265,7 +255,7 @@ class ExtractIbmReleases {
                 Date.from(binary.updated_at.dateTime.toInstant()),
                 binary.scm_ref,
                 binary.scm_ref,
-                distribution,
+                Distribution.semeru,
                 aqaLink,
                 "<Insert TCK Affidavit Here>"
             )
