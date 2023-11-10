@@ -92,6 +92,7 @@
         <module>adoptium-api-v3-telemetry</module>
         <module>adoptium-updater-parent</module>
         <module>adoptium-frontend-parent</module>
+        <module>adoptopenjdk-api-v3-staging-checker</module>
     </modules>
 
     <dependencyManagement>
