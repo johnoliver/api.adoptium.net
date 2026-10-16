@@ -2,12 +2,21 @@ package net.adoptium.api
 
 import io.mockk.coEvery
 import io.mockk.coVerify
+import io.mockk.every
 import io.mockk.mockk
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import net.adoptium.api.v3.AdoptReposBuilder
 import net.adoptium.api.v3.AdoptRepository
+import net.adoptium.api.v3.ReleaseFilterType
+import net.adoptium.api.v3.ReleaseIncludeFilter
 import net.adoptium.api.v3.ReleaseResult
 import net.adoptium.api.v3.TimeSource
+import net.adoptium.api.v3.dataSources.VersionSupplier
 import net.adoptium.api.v3.dataSources.github.graphql.models.PageInfo
 import net.adoptium.api.v3.dataSources.github.graphql.models.summary.GHAssetsSummary
 import net.adoptium.api.v3.dataSources.github.graphql.models.summary.GHReleaseSummary
@@ -28,6 +37,7 @@ import net.adoptium.api.v3.mapping.upstream.UpstreamReleaseMapper
 import net.adoptium.api.v3.dataSources.github.graphql.models.GHAssets
 import net.adoptium.api.v3.dataSources.github.graphql.models.GHRelease
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.params.ParameterizedTest
 import org.junit.jupiter.params.provider.ValueSource
@@ -36,6 +46,150 @@ import java.time.format.DateTimeFormatter
 
 class AdoptReposBuilderEaPollingTest {
     private val now = TimeSource.now().withNano(0)
+
+    @ParameterizedTest
+    @ValueSource(strings = ["build-build", "build-incremental", "incremental-build", "incremental-incremental"])
+    fun `full and incremental builds serialize access to shared state`(order: String) = runBlocking {
+        withTimeout(5000) {
+            val entered = CompletableDeferred<Unit>()
+            val resume = CompletableDeferred<Unit>()
+            var calls = 0
+            suspend fun visitRepository() {
+                calls++
+                if (calls == 1) {
+                    entered.complete(Unit)
+                    resume.await()
+                }
+            }
+            val repository = mockk<AdoptRepository>()
+            coEvery { repository.getSummary(8) } coAnswers {
+                visitRepository()
+                GHRepositorySummary(GHReleasesSummary(emptyList(), PageInfo(false, null)))
+            }
+            coEvery { repository.getRelease(8, ReleaseIncludeFilter.INCLUDE_ALL) } coAnswers {
+                visitRepository()
+                FeatureRelease(8, Releases(emptyList()))
+            }
+            val versions = mockk<VersionSupplier>()
+            every { versions.getAllVersions() } returns arrayOf(8)
+            val builder = AdoptReposBuilder(repository, versions)
+            suspend fun update(mode: String): AdoptRepos = if (mode == "build") {
+                builder.build(ReleaseIncludeFilter.INCLUDE_ALL)
+            } else {
+                builder.incrementalUpdate(emptySet(), AdoptRepos(listOf(FeatureRelease(8, Releases(emptyList()))))) { null }
+            }
+            val modes = order.split("-")
+            val first = async(start = CoroutineStart.UNDISPATCHED) { update(modes[0]) }
+            entered.await()
+            val second = async(start = CoroutineStart.UNDISPATCHED) { update(modes[1]) }
+            try {
+                assertEquals(1, calls, "The second operation must wait for the first operation's lock")
+            } finally {
+                resume.complete(Unit)
+            }
+            first.await()
+            second.await()
+            assertEquals(2, calls)
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = ["retryable", "null", "exception", "cancellation"])
+    fun `failed explicit historical EA refresh retries without another request`(failure: String) = runBlocking {
+        val old = release("historical.old-split", now.minusDays(40))
+        val other = release("historical.other-split", now.minusDays(40))
+        val latest = release("latest", now.minusDays(20))
+        val repository = mockk<AdoptRepository>()
+        coEvery { repository.getSummary(8) } returns GHRepositorySummary(GHReleasesSummary(
+            listOf(summary(old), summary(latest)), PageInfo(false, null)))
+        coEvery { repository.getReleaseById(GitHubId(latest.id)) } returns ReleaseResult(listOf(latest))
+        coEvery { repository.getReleaseById(GitHubId(old.id)) } coAnswers {
+            when (failure) {
+                "null" -> null
+                "exception" -> throw IllegalStateException("Temporary failure")
+                "cancellation" -> throw CancellationException("Interrupted refresh")
+                else -> ReleaseResult(error = "Temporary failure")
+            }
+        }
+        val builder = AdoptReposBuilder(repository, mockk())
+        val before = repo(listOf(old, other, latest))
+        var snapshot = if (failure == "cancellation") {
+            assertThrows(CancellationException::class.java) {
+                runBlocking { builder.incrementalUpdate(setOf(old.release_name), before) { null } }
+            }
+            coEvery { repository.getReleaseById(GitHubId(old.id)) } returns ReleaseResult(error = "Retry")
+            before
+        } else builder.incrementalUpdate(setOf(old.release_name), before) { null }
+        assertEquals(before, snapshot)
+        snapshot = builder.incrementalUpdate(emptySet(), snapshot) { null }
+        assertEquals(before, snapshot)
+        coVerify(exactly = 2) { repository.getReleaseById(GitHubId(old.id)) }
+        coEvery { repository.getReleaseById(GitHubId(old.id)) } returns ReleaseResult(listOf(old))
+        snapshot = builder.incrementalUpdate(emptySet(), snapshot) { null }
+        assertEquals(repo(listOf(old, latest)), snapshot)
+        builder.incrementalUpdate(emptySet(), snapshot) { null }
+        coVerify(exactly = 3) { repository.getReleaseById(GitHubId(old.id)) }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = ["empty", "excluded", "removed", "feature-removed", "build", "filtered-build", "failed-build"])
+    fun `pending historical refreshes are cleared by completed or removed snapshots`(outcome: String) = runBlocking {
+        val old = release("historical", now.minusDays(40))
+        val latest = release("latest", now.minusDays(20))
+        var summaries = listOf(summary(old), summary(latest))
+        val repository = mockk<AdoptRepository>()
+        coEvery { repository.getSummary(8) } answers {
+            GHRepositorySummary(GHReleasesSummary(summaries, PageInfo(false, null)))
+        }
+        coEvery { repository.getReleaseById(GitHubId(latest.id)) } returns ReleaseResult(listOf(latest))
+        coEvery { repository.getReleaseById(GitHubId(old.id)) } returns ReleaseResult(error = "Retry")
+        val versions = mockk<VersionSupplier>()
+        every { versions.getAllVersions() } returns arrayOf(8)
+        val builder = AdoptReposBuilder(repository, versions)
+        val before = repo(listOf(old, latest))
+        var snapshot = builder.incrementalUpdate(setOf(old.release_name), before) { null }
+        assertEquals(before, snapshot)
+        when (outcome) {
+            "empty", "excluded" -> {
+                coEvery { repository.getReleaseById(GitHubId(old.id)) } returns
+                    if (outcome == "empty") ReleaseResult(emptyList()) else ReleaseResult(error = "Excluded", retryable = false)
+                snapshot = builder.incrementalUpdate(emptySet(), snapshot) { null }
+                assertEquals(repo(listOf(latest)), snapshot)
+                builder.incrementalUpdate(emptySet(), snapshot) { null }
+                coVerify(exactly = 2) { repository.getReleaseById(GitHubId(old.id)) }
+            }
+            else -> {
+                when (outcome) {
+                    "removed" -> {
+                        summaries = listOf(summary(latest))
+                        builder.incrementalUpdate(emptySet(), snapshot) { null }
+                        summaries = listOf(summary(old), summary(latest))
+                    }
+                    "feature-removed" -> builder.incrementalUpdate(emptySet(), AdoptRepos(emptyList())) { null }
+                    "build" -> {
+                        coEvery { repository.getRelease(8, ReleaseIncludeFilter.INCLUDE_ALL) } returns before.repos.getValue(8)
+                        builder.build(ReleaseIncludeFilter.INCLUDE_ALL)
+                    }
+                    "filtered-build" -> {
+                        val filter = ReleaseIncludeFilter(now, ReleaseFilterType.RELEASES_ONLY)
+                        coEvery { repository.getRelease(8, filter) } returns repo(listOf(latest)).repos.getValue(8)
+                        builder.build(filter)
+                    }
+                    "failed-build" -> {
+                        coEvery { repository.getRelease(8, ReleaseIncludeFilter.INCLUDE_ALL) } throws IllegalStateException("Unavailable")
+                        assertThrows(IllegalStateException::class.java) {
+                            runBlocking { builder.build(ReleaseIncludeFilter.INCLUDE_ALL) }
+                        }
+                    }
+                }
+                // Unchanged stored splits distinguish pending retries from new-ID selection.
+                builder.incrementalUpdate(emptySet(), before) { null }
+                coVerify(exactly = if (outcome in setOf("filtered-build", "failed-build")) 2 else 1) {
+                    repository.getReleaseById(GitHubId(old.id))
+                }
+            }
+        }
+    }
 
     @Test
     fun `date free upstream names use mapper classification and poll old latest EA`() = runBlocking {

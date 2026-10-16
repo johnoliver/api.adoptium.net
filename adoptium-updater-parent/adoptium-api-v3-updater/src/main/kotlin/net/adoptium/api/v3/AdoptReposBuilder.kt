@@ -3,6 +3,8 @@ package net.adoptium.api.v3
 import jakarta.enterprise.context.ApplicationScoped
 import jakarta.inject.Inject
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import net.adoptium.api.v3.dataSources.VersionSupplier
 import net.adoptium.api.v3.dataSources.github.graphql.models.summary.GHReleaseSummary
 import net.adoptium.api.v3.dataSources.models.AdoptRepos
@@ -31,18 +33,23 @@ class AdoptReposBuilder @Inject constructor(
     // upstream ID, repository URL, vendor, timestamps, name, prerelease and asset count.
     private data class CompletedOutcome(val summary: GHReleaseSummary, val excluded: Boolean)
     private val completedOutcomes = mutableMapOf<Int, MutableMap<GitHubId, CompletedOutcome>>()
+    private val pendingRefreshes = mutableMapOf<Int, MutableSet<GitHubId>>()
+    // Both scheduler jobs use this application-scoped builder. Protect nested state
+    // and full-build resets across suspension points, not just individual map writes.
+    private val updateMutex = Mutex()
 
     suspend fun incrementalUpdate(
         toUpdate: Set<String>,
         repo: AdoptRepos,
         gitHubMetadataSupplier: suspend (GitHubId) -> GHReleaseMetadata?,
-    ): AdoptRepos {
+    ): AdoptRepos = updateMutex.withLock {
         completedOutcomes.keys.retainAll(repo.repos.keys)
+        pendingRefreshes.keys.retainAll(repo.repos.keys)
         val updated = repo
             .repos
             .map { entry -> getUpdatedFeatureRelease(toUpdate, entry, gitHubMetadataSupplier) }
 
-        return AdoptRepos(updated)
+        AdoptRepos(updated)
     }
 
     private suspend fun getUpdatedFeatureRelease(
@@ -55,6 +62,8 @@ class AdoptReposBuilder @Inject constructor(
         val pruned = entry.value.releases.nodes.filterValues { GitHubId(it.id) in ids }
         val current = pruned.values.groupBy { GitHubId(it.id) }
         val completed = completedOutcomes.getOrPut(entry.key) { mutableMapOf() }
+        val pending = pendingRefreshes.getOrPut(entry.key) { mutableSetOf() }
+        pending.retainAll(ids)
         val summariesById = summaries.associateBy { it.id }
         completed.entries.removeAll { (id, outcome) ->
             outcome.summary != summariesById[id] || id in current
@@ -84,7 +93,7 @@ class AdoptReposBuilder @Inject constructor(
             val previous = current[summary.id]
             val outcome = completed[summary.id]
             if (!isReleaseOldEnough(summary.publishedAt)) return@filter false
-            if (summary.name in toUpdate) return@filter true
+            if (summary.name in toUpdate || summary.id in pending) return@filter true
             if (outcome?.excluded == true) return@filter false
             (previous == null && outcome == null) ||
                 previous.orEmpty().any { ChronoUnit.SECONDS.between(it.updated_at.dateTime, summary.getUpdatedTime()) != 0L } ||
@@ -94,9 +103,13 @@ class AdoptReposBuilder @Inject constructor(
                 (outcome == null && (gitHubMetadataSupplier(summary.id)?.totalBinaryCount
                     ?.let { it != summary.releaseAssets.totalCount } ?: false))
         }
-        val outcomes = selected.associate { summary ->
+        selected.forEach { summary ->
             // A failed retry must not leave an old exclusion/empty result suppressing recovery.
             completed.remove(summary.id)
+            // Remember requests before fetching, including attempts interrupted by cancellation.
+            pending.add(summary.id)
+        }
+        val outcomes = selected.associate { summary ->
             val result = try {
                 adoptRepository.getReleaseById(summary.id) ?: ReleaseResult(error = "Release unavailable")
             } catch (e: CancellationException) {
@@ -110,6 +123,7 @@ class AdoptReposBuilder @Inject constructor(
         // Only complete snapshots (including empty ones) and explicit permanent
         // exclusions replace all old splits. Retryable failures preserve them.
         val replacements = outcomes.filterValues { it.succeeded() || !it.retryable }
+        pending.removeAll(replacements.keys)
         replacements.forEach { (id, result) ->
             if (!result.succeeded() || result.result!!.isEmpty()) {
                 completed[id] = CompletedOutcome(summariesById.getValue(id), !result.succeeded())
@@ -128,7 +142,7 @@ class AdoptReposBuilder @Inject constructor(
         return ChronoUnit.MINUTES.between(created, TimeSource.now()).absoluteValue > 10
     }
 
-    suspend fun build(filter: ReleaseIncludeFilter): AdoptRepos {
+    suspend fun build(filter: ReleaseIncludeFilter): AdoptRepos = updateMutex.withLock {
         // Fetch repos in parallel
         val reposMap = versionSupplier
             .getAllVersions()
@@ -139,7 +153,12 @@ class AdoptReposBuilder @Inject constructor(
             .associateBy { it.featureVersion }
         // A successful full build starts a new snapshot; failures retain incremental state.
         completedOutcomes.clear()
+        // A filtered full build may omit historical EAs, so only clear requests
+        // for IDs actually refreshed by it. The summary pass prunes deleted IDs.
+        reposMap.forEach { (version, feature) ->
+            pendingRefreshes[version]?.removeAll(feature.releases.nodes.values.map { GitHubId(it.id) }.toSet())
+        }
         LOGGER.info("DONE")
-        return AdoptRepos(reposMap)
+        AdoptRepos(reposMap)
     }
 }
