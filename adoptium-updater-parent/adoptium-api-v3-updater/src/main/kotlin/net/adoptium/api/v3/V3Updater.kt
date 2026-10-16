@@ -121,6 +121,7 @@ class V3Updater @Inject constructor(
             val updatedRepo = adoptReposBuilder.incrementalUpdate(requests, oldRepo, database::getGhReleaseMetadata)
             if (updatedRepo != oldRepo) {
                 val after = writeIncrementalUpdate(updatedRepo, oldRepo)
+                if (after != updatedRepo) toUpdate.addAll(requests)
                 printRepoDebugInfo(oldRepo, after, null)
                 return after
             }
