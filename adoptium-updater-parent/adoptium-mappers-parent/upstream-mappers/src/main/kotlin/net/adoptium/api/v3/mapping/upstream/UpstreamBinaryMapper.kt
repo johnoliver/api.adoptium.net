@@ -1,8 +1,5 @@
 package net.adoptium.api.v3.mapping.upstream
 
-import kotlinx.coroutines.Deferred
-import kotlinx.coroutines.GlobalScope
-import kotlinx.coroutines.async
 import net.adoptium.api.v3.dataSources.github.graphql.models.GHAsset
 import net.adoptium.api.v3.mapping.BinaryMapper
 import net.adoptium.api.v3.models.Architecture
@@ -23,46 +20,43 @@ object UpstreamBinaryMapper : BinaryMapper() {
 
     private val EXCLUDES = listOf("sources", "debuginfo")
 
-    suspend fun toBinaryList(assets: List<GHAsset>): List<Binary> {
+    fun toBinaryList(assets: List<GHAsset>): List<Binary> {
         return assets
             .filter(this::isArchive)
             .filter { !assetIsExcluded(it) }
-            .map { asset -> assetToBinaryAsync(asset, assets) }
-            .mapNotNull { it.await() }
+            .mapNotNull { asset -> assetToBinary(asset, assets) }
     }
 
     private fun assetIsExcluded(asset: GHAsset) = EXCLUDES.any { exclude -> asset.name.contains(exclude) }
 
-    private fun assetToBinaryAsync(asset: GHAsset, assets: List<GHAsset>): Deferred<Binary?> {
-        return GlobalScope.async {
-            try {
-                val signatureLink = getSignatureLink(assets, asset.name)
-                val pack = Package(asset.name, asset.downloadUrl, asset.size, null, null, asset.downloadCount, signatureLink, null)
+    private fun assetToBinary(asset: GHAsset, assets: List<GHAsset>): Binary? {
+        return try {
+            val signatureLink = getSignatureLink(assets, asset.name)
+            val pack = Package(asset.name, asset.downloadUrl, asset.size, null, null, asset.downloadCount, signatureLink, null)
 
-                val os = getEnumFromFileName(asset.name, OperatingSystem.entries.toTypedArray())
-                val architecture = getEnumFromFileName(asset.name, Architecture.entries.toTypedArray())
-                val imageType = getEnumFromFileName(asset.name, ImageType.entries.toTypedArray(), ImageType.jdk)
-                val updatedAt = getUpdatedTime(asset)
-                val projectType = getEnumFromFileName(asset.name, Project.entries.toTypedArray(), Project.jdk)
+            val os = getEnumFromFileName(asset.name, OperatingSystem.entries.toTypedArray())
+            val architecture = getEnumFromFileName(asset.name, Architecture.entries.toTypedArray())
+            val imageType = getEnumFromFileName(asset.name, ImageType.entries.toTypedArray(), ImageType.jdk)
+            val updatedAt = getUpdatedTime(asset)
+            val projectType = getEnumFromFileName(asset.name, Project.entries.toTypedArray(), Project.jdk)
 
-                Binary(
-                    pack,
-                    asset.downloadCount,
-                    DateTime(updatedAt),
-                    null,
-                    null,
-                    HeapSize.normal,
-                    os,
-                    architecture,
-                    imageType,
-                    JvmImpl.hotspot,
-                    projectType,
-                    null,
-                )
-            } catch (e: Exception) {
-                LOGGER.error("Failed to parse binary data", e)
-                return@async null
-            }
+            Binary(
+                pack,
+                asset.downloadCount,
+                DateTime(updatedAt),
+                null,
+                null,
+                HeapSize.normal,
+                os,
+                architecture,
+                imageType,
+                JvmImpl.hotspot,
+                projectType,
+                null,
+            )
+        } catch (e: Exception) {
+            LOGGER.error("Failed to parse binary data", e)
+            null
         }
     }
 

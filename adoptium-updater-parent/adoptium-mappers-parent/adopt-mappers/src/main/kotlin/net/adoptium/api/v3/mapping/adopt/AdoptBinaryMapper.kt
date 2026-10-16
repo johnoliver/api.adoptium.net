@@ -3,9 +3,9 @@ package net.adoptium.api.v3.mapping.adopt
 import jakarta.enterprise.context.ApplicationScoped
 import jakarta.inject.Inject
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.Deferred
-import kotlinx.coroutines.GlobalScope
 import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import net.adoptium.api.v3.dataSources.github.GitHubHtmlClient
 import net.adoptium.api.v3.dataSources.github.graphql.models.GHAsset
 import net.adoptium.api.v3.dataSources.github.graphql.models.GHMetaData
@@ -32,6 +32,7 @@ class AdoptBinaryMapper @Inject constructor(private val gitHubHtmlClient: GitHub
         private val LOGGER = LoggerFactory.getLogger(AdoptBinaryMapper::class.java)
         private const val HOTSPOT_JFR = "hotspot-jfr"
         private const val TEMURIN = "temurin"
+        private const val MAPPING_BATCH_SIZE = 16
 
         private val EXCLUDED = listOf("corretto", "AQAvitTapFiles")
     }
@@ -41,51 +42,46 @@ class AdoptBinaryMapper @Inject constructor(private val gitHubHtmlClient: GitHub
         return toSelectedBinaryList(ghBinaryAssets.filter(::isSupportedBinaryAsset), allGhAssets, ghAssetsWithMetadata)
     }
 
-    internal suspend fun toSelectedBinaryList(ghBinaryAssets: List<GHAsset>, allGhAssets: List<GHAsset>, ghAssetsWithMetadata: Map<GHAsset, GHMetaData>): List<Binary> {
-        return ghBinaryAssets
-            .map { asset -> assetToBinaryAsync(asset, ghAssetsWithMetadata, allGhAssets) }
-            .mapNotNull { it.await() }
+    internal suspend fun toSelectedBinaryList(ghBinaryAssets: List<GHAsset>, allGhAssets: List<GHAsset>, ghAssetsWithMetadata: Map<GHAsset, GHMetaData>): List<Binary> = coroutineScope {
+        ghBinaryAssets.chunked(MAPPING_BATCH_SIZE).flatMap { batch ->
+            batch.map { asset -> async { assetToBinary(asset, ghAssetsWithMetadata, allGhAssets) } }
+                .awaitAll().filterNotNull()
+        }
     }
 
-    private fun assetToBinaryAsync(
+    private suspend fun assetToBinary(
         ghBinaryAsset: GHAsset,
         ghAssetsWithMetadata: Map<GHAsset, GHMetaData>,
         allGhAssets: List<GHAsset>
-    ): Deferred<Binary?> {
-        return GlobalScope.async {
-            try {
-                val updatedAt = getUpdatedTime(ghBinaryAsset)
+    ): Binary? {
+        return try {
+            val updatedAt = getUpdatedTime(ghBinaryAsset)
+            val binaryMetadata = ghAssetsWithMetadata[ghBinaryAsset]
+            val heapSize = getEnumFromFileName(ghBinaryAsset.name, HeapSize.entries.toTypedArray(), HeapSize.normal)
+            val cLib = getEnumFromFileNameNullable(ghBinaryAsset.name, CLib.entries.toTypedArray(), null)
+            val installer = getInstaller(ghBinaryAsset, allGhAssets)
+            val `package` = getPackage(allGhAssets, ghBinaryAsset, binaryMetadata)
+            val downloadCount = `package`.download_count + (installer?.download_count ?: 0)
 
-                val binaryMetadata = ghAssetsWithMetadata[ghBinaryAsset]
-
-                val heapSize = getEnumFromFileName(ghBinaryAsset.name, HeapSize.entries.toTypedArray(), HeapSize.normal)
-
-                val cLib = getEnumFromFileNameNullable(ghBinaryAsset.name, CLib.entries.toTypedArray(), null)
-
-                val installer = getInstaller(ghBinaryAsset, allGhAssets)
-                val `package` = getPackage(allGhAssets, ghBinaryAsset, binaryMetadata)
-                val downloadCount = `package`.download_count + (installer?.download_count ?: 0)
-
-                if (binaryMetadata != null) {
-                    return@async binaryFromMetadata(
-                        ghBinaryAsset,
-                        binaryMetadata,
-                        `package`,
-                        downloadCount,
-                        updatedAt,
-                        installer,
-                        heapSize,
-                        cLib
-                    )
-                } else {
-                    return@async binaryFromName(ghBinaryAsset, `package`, downloadCount, updatedAt, installer, heapSize, cLib)
-                }
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                LOGGER.error("Failed to fetch binary ${ghBinaryAsset.name}", e)
-                return@async null
+            if (binaryMetadata != null) {
+                binaryFromMetadata(
+                    ghBinaryAsset,
+                    binaryMetadata,
+                    `package`,
+                    downloadCount,
+                    updatedAt,
+                    installer,
+                    heapSize,
+                    cLib
+                )
+            } else {
+                binaryFromName(ghBinaryAsset, `package`, downloadCount, updatedAt, installer, heapSize, cLib)
             }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            LOGGER.error("Failed to fetch binary ${ghBinaryAsset.name}", e)
+            null
         }
     }
 

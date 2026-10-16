@@ -59,7 +59,6 @@ import org.junit.jupiter.params.ParameterizedTest
 import org.junit.jupiter.params.provider.ValueSource
 import tools.jackson.databind.json.JsonMapper
 import java.time.format.DateTimeFormatter
-import java.util.concurrent.atomic.AtomicBoolean
 
 /** No asset identity, digest cache, retention, or bounded-EA-selection dependencies. */
 class ReleaseSnapshotTest {
@@ -168,7 +167,7 @@ class ReleaseSnapshotTest {
         }))
         val database = spyk(InMemoryApiPersistence(previous, mockk()))
         assertNull(database.getLatestGithubStatsForFeatureVersion(8))
-        updater(builder, database, versions).runUpdate(previous, AtomicBoolean(true), mockk())
+        updater(builder, database, versions).runUpdate(previous)
         assertEquals(nodes(previous), nodes(database.repos))
         coVerify(exactly = 0) { database.updateAllRepos(any(), any()) }
     }
@@ -237,7 +236,7 @@ class ReleaseSnapshotTest {
         val updated = try {
             // Legacy repositories are intentionally excluded from normal full updates.
             APIConfig.UPDATE_ADOPTOPENJDK = true
-            updater(builder, database, versions).runUpdate(previous, AtomicBoolean(true), mockk())
+            updater(builder, database, versions).runUpdate(previous)
         } finally {
             APIConfig.UPDATE_ADOPTOPENJDK = updateAdoptOpenJdk
         }
@@ -437,7 +436,7 @@ class ReleaseSnapshotTest {
         val updater = updater(builder, database, versions)
         // No download statistics: the stats guard cannot hide a partial snapshot.
         assertNull(database.getLatestGithubStatsForFeatureVersion(8))
-        assertEquals(previous, updater.runUpdate(previous, AtomicBoolean(true), mockk()))
+        assertEquals(previous, updater.runUpdate(previous))
         assertEquals(nodes(previous), nodes(database.repos))
         coVerify(exactly = 0) { database.updateAllRepos(any(), any()) }
         current = complete

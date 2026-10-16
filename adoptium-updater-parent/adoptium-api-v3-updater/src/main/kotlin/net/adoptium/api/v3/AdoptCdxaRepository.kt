@@ -2,9 +2,6 @@ package net.adoptium.api.v3
 
 import jakarta.enterprise.context.ApplicationScoped
 import jakarta.inject.Inject
-import kotlinx.coroutines.Deferred
-import kotlinx.coroutines.GlobalScope
-import kotlinx.coroutines.async
 import net.adoptium.api.v3.dataSources.github.GitHubApi
 import net.adoptium.api.v3.dataSources.github.graphql.models.GHAsset
 import net.adoptium.api.v3.dataSources.github.graphql.models.PageInfo
@@ -214,7 +211,7 @@ open class AdoptCdxaRepositoryImpl @Inject constructor(
 
         val summaries: List<CdxaRepoVersionSummary> = getDataForEachRepo(
             getSummaries()
-        ).await().flatMap { it.toList() }
+        ).flatMap { it.toList() }
 
         var updatedCdxas = oldRepo.repos.toMutableList()
         var latestCommittedDate: Instant? = null
@@ -268,7 +265,7 @@ open class AdoptCdxaRepositoryImpl @Inject constructor(
         
         val results: List<Pair<List<Cdxa>, Instant?>> = getDataForEachRepo(
             getRepository()
-        ).await()
+        )
 
         val cdxas = results.flatMap { it.first }
         val latestCommittedDate = results.mapNotNull { it.second }.maxOrNull()
@@ -276,29 +273,12 @@ open class AdoptCdxaRepositoryImpl @Inject constructor(
         return Pair(cdxas, latestCommittedDate)
     }
 
-    private fun <E> getDataForEachRepo(
+    private suspend fun <E> getDataForEachRepo(
         getFun: suspend (Vendor, String, String) -> E
-    ): Deferred<List<E>> {
-        return GlobalScope.async {
-
-            return@async listOf(
-                getRepoDataAsync(ADOPTIUM_ORG, Vendor.eclipse, "temurin-cdxa", getFun),
-            )
-                .map { repo -> repo.await() }
-        }
-    }
-
-    private fun <E> getRepoDataAsync(
-        owner: String,
-        vendor: Vendor,
-        repoName: String,
-        getFun: suspend (Vendor, String, String) -> E
-    ): Deferred<E> {
-        return GlobalScope.async {
-            LOGGER.info("getting cdxas for $owner $repoName")
-            val cdxas = getFun(vendor, owner, repoName)
-            LOGGER.info("Done getting cdxas for $owner $repoName")
-            return@async cdxas
-        }
+    ): List<E> {
+        LOGGER.info("getting cdxas for $ADOPTIUM_ORG temurin-cdxa")
+        val result = getFun(Vendor.eclipse, ADOPTIUM_ORG, "temurin-cdxa")
+        LOGGER.info("Done getting cdxas for $ADOPTIUM_ORG temurin-cdxa")
+        return listOf(result)
     }
 }
