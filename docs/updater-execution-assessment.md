@@ -45,6 +45,10 @@ This worktree contains an execution-model prototype, not a performance benchmark
 - Explicit requests are actually enqueued (the previous `String.plus` expression
   discarded them). Queue polling replaces copy-and-clear, preventing concurrent
   additions from being erased. Failed cycles requeue their drained requests.
+- Incremental retry cleanup and completed empty/excluded outcomes are staged until
+  publication accepts the combined snapshot. Attempted IDs remain pending after a
+  later feature fails, publication throws, or a database checksum mismatch rejects
+  the proposal, even when no explicit requests were drained in that cycle.
 - Existing builder and publication locks, database checksum checks, refresh
   policies and complete-snapshot guards remain. The builder lock is defensive
   for direct callers; scheduled cycles no longer depend on it for ownership.

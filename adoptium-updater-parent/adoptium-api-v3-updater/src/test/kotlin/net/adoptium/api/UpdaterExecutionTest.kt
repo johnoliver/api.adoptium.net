@@ -79,7 +79,7 @@ class UpdaterExecutionTest {
         every { store.loadDataFromDb(true) } returns repo
         val name = repo.allReleases.nodeList.first().release_name
         val requests = mutableListOf<Set<String>>()
-        coEvery { builder.incrementalUpdate(capture(requests), repo, any()) } answers {
+        coEvery { builder.incrementalUpdateAndPublish(capture(requests), repo, any(), any()) } answers {
             if (requests.size == 1) updater.addToUpdate(name)
             repo
         }
@@ -105,16 +105,16 @@ class UpdaterExecutionTest {
             "interruption" -> InterruptedException("Stopped")
             else -> IllegalStateException("Unavailable")
         }
-        coEvery { builder.incrementalUpdate(setOf(name), repo, any()) } throws error
+        coEvery { builder.incrementalUpdateAndPublish(setOf(name), repo, any(), any()) } throws error
         updater.addToUpdate(name)
         if (failure != "failure") {
             assertSame(error, assertThrows(error.javaClass) { runBlocking { updater.incrementalUpdate(repo) } })
         } else {
             updater.incrementalUpdate(repo)
         }
-        coEvery { builder.incrementalUpdate(setOf(name), repo, any()) } returns repo
+        coEvery { builder.incrementalUpdateAndPublish(setOf(name), repo, any(), any()) } returns repo
         updater.incrementalUpdate(repo)
-        coVerify(exactly = 2) { builder.incrementalUpdate(setOf(name), repo, any()) }
+        coVerify(exactly = 2) { builder.incrementalUpdateAndPublish(setOf(name), repo, any(), any()) }
     }
 
     @Test

@@ -118,10 +118,14 @@ class V3Updater @Inject constructor(
         val requests = generateSequence { toUpdate.poll() }.toSet()
         try {
             LOGGER.info("Starting Incremental update")
-            val updatedRepo = adoptReposBuilder.incrementalUpdate(requests, oldRepo, database::getGhReleaseMetadata)
-            if (updatedRepo != oldRepo) {
-                val after = writeIncrementalUpdate(updatedRepo, oldRepo)
-                if (after != updatedRepo) toUpdate.addAll(requests)
+            val after = adoptReposBuilder.incrementalUpdateAndPublish(requests, oldRepo, database::getGhReleaseMetadata) { proposed ->
+                if (proposed == oldRepo) proposed else {
+                    writeIncrementalUpdate(proposed, oldRepo).also { accepted ->
+                        if (accepted != proposed) toUpdate.addAll(requests)
+                    }
+                }
+            }
+            if (after != oldRepo) {
                 printRepoDebugInfo(oldRepo, after, null)
                 return after
             }

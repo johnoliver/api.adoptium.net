@@ -42,27 +42,41 @@ class AdoptReposBuilder @Inject constructor(
         toUpdate: Set<String>,
         repo: AdoptRepos,
         gitHubMetadataSupplier: suspend (GitHubId) -> GHReleaseMetadata?,
-    ): AdoptRepos = updateMutex.withLock {
-        completedOutcomes.keys.retainAll(repo.repos.keys)
-        pendingRefreshes.keys.retainAll(repo.repos.keys)
-        val updated = repo
-            .repos
-            .map { entry -> getUpdatedFeatureRelease(toUpdate, entry, gitHubMetadataSupplier) }
+    ): AdoptRepos = incrementalUpdateAndPublish(toUpdate, repo, gitHubMetadataSupplier) { it }
 
-        AdoptRepos(updated)
+    internal suspend fun incrementalUpdateAndPublish(
+        toUpdate: Set<String>,
+        repo: AdoptRepos,
+        gitHubMetadataSupplier: suspend (GitHubId) -> GHReleaseMetadata?,
+        publish: suspend (AdoptRepos) -> AdoptRepos,
+    ): AdoptRepos = updateMutex.withLock {
+        val completed = completedOutcomes.filterKeys { it in repo.repos }.mapValues { it.value.toMutableMap() }.toMutableMap()
+        val pending = pendingRefreshes.filterKeys { it in repo.repos }.mapValues { it.value.toMutableSet() }.toMutableMap()
+        val updated = AdoptRepos(repo.repos.map { entry ->
+            getUpdatedFeatureRelease(toUpdate, entry, gitHubMetadataSupplier,
+                completed.getOrPut(entry.key) { mutableMapOf() }, pending.getOrPut(entry.key) { mutableSetOf() })
+        })
+        val accepted = publish(updated)
+        if (accepted == updated) {
+            completedOutcomes.clear()
+            completedOutcomes.putAll(completed)
+            pendingRefreshes.clear()
+            pendingRefreshes.putAll(pending)
+        }
+        accepted
     }
 
     private suspend fun getUpdatedFeatureRelease(
         toUpdate: Set<String>,
         entry: Map.Entry<Int, FeatureRelease>,
         gitHubMetadataSupplier: suspend (GitHubId) -> GHReleaseMetadata?,
+        completed: MutableMap<GitHubId, CompletedOutcome>,
+        pending: MutableSet<GitHubId>,
     ): FeatureRelease {
         val summaries = adoptRepository.getSummary(entry.key).releases.releases.distinctBy { it.id }
         val ids = summaries.map { it.id }.toSet()
         val pruned = entry.value.releases.nodes.filterValues { GitHubId(it.id) in ids }
         val current = pruned.values.groupBy { GitHubId(it.id) }
-        val completed = completedOutcomes.getOrPut(entry.key) { mutableMapOf() }
-        val pending = pendingRefreshes.getOrPut(entry.key) { mutableSetOf() }
         pending.retainAll(ids)
         val summariesById = summaries.associateBy { it.id }
         completed.entries.removeAll { (id, outcome) ->
@@ -106,7 +120,8 @@ class AdoptReposBuilder @Inject constructor(
         selected.forEach { summary ->
             // A failed retry must not leave an old exclusion/empty result suppressing recovery.
             completed.remove(summary.id)
-            // Remember requests before fetching, including attempts interrupted by cancellation.
+            // Attempts are durable immediately; cleanup is committed only after publication.
+            pendingRefreshes.getOrPut(entry.key) { mutableSetOf() }.add(summary.id)
             pending.add(summary.id)
         }
         val outcomes = selected.associate { summary ->
