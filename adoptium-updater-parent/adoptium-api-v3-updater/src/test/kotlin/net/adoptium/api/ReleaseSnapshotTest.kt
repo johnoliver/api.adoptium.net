@@ -59,7 +59,6 @@ import org.junit.jupiter.params.ParameterizedTest
 import org.junit.jupiter.params.provider.ValueSource
 import tools.jackson.databind.json.JsonMapper
 import java.time.format.DateTimeFormatter
-import java.util.concurrent.atomic.AtomicBoolean
 
 /** No asset identity, digest cache, retention, or bounded-EA-selection dependencies. */
 class ReleaseSnapshotTest {
@@ -82,8 +81,9 @@ class ReleaseSnapshotTest {
          "scmRef":"test","version_data":"jdk8u","sha256":"checksum"}
     """.trimIndent()
 
-    private fun client(): GitHubHtmlClient = mockk<GitHubHtmlClient>().also {
-        coEvery { it.getUrl(any()) } answers { metadata(if (firstArg<String>().contains("-2")) 2 else 1) }
+    private fun client(): GitHubHtmlClient = mockk<GitHubHtmlClient>().also { client ->
+        coEvery { client.getUrl(any()) } answers { metadata(if (firstArg<String>().contains("-2")) 2 else 1) }
+        coEvery { client.getAsset(any()) } coAnswers { client.getUrl(firstArg<GHAsset>().downloadUrl) }
     }
 
     private fun factory(client: GitHubHtmlClient) = AdoptReleaseMapperFactory(AdoptBinaryMapper(client), client)
@@ -167,7 +167,7 @@ class ReleaseSnapshotTest {
         }))
         val database = spyk(InMemoryApiPersistence(previous, mockk()))
         assertNull(database.getLatestGithubStatsForFeatureVersion(8))
-        updater(builder, database, versions).runUpdate(previous, AtomicBoolean(true), mockk())
+        updater(builder, database, versions).runUpdate(previous)
         assertEquals(nodes(previous), nodes(database.repos))
         coVerify(exactly = 0) { database.updateAllRepos(any(), any()) }
     }
@@ -236,7 +236,7 @@ class ReleaseSnapshotTest {
         val updated = try {
             // Legacy repositories are intentionally excluded from normal full updates.
             APIConfig.UPDATE_ADOPTOPENJDK = true
-            updater(builder, database, versions).runUpdate(previous, AtomicBoolean(true), mockk())
+            updater(builder, database, versions).runUpdate(previous)
         } finally {
             APIConfig.UPDATE_ADOPTOPENJDK = updateAdoptOpenJdk
         }
@@ -436,7 +436,7 @@ class ReleaseSnapshotTest {
         val updater = updater(builder, database, versions)
         // No download statistics: the stats guard cannot hide a partial snapshot.
         assertNull(database.getLatestGithubStatsForFeatureVersion(8))
-        assertEquals(previous, updater.runUpdate(previous, AtomicBoolean(true), mockk()))
+        assertEquals(previous, updater.runUpdate(previous))
         assertEquals(nodes(previous), nodes(database.repos))
         coVerify(exactly = 0) { database.updateAllRepos(any(), any()) }
         current = complete

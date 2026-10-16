@@ -4,10 +4,12 @@ import com.mongodb.MongoException
 import io.quarkus.arc.profile.UnlessBuildProfile
 import io.quarkus.runtime.Quarkus
 import io.quarkus.runtime.Startup
+import jakarta.annotation.PreDestroy
 import jakarta.enterprise.context.ApplicationScoped
 import jakarta.inject.Inject
 import jakarta.ws.rs.ApplicationPath
 import jakarta.ws.rs.core.Application
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -27,12 +29,10 @@ import org.slf4j.LoggerFactory
 import java.io.OutputStream
 import java.security.MessageDigest
 import java.util.*
-import java.util.concurrent.ConcurrentSkipListSet
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicBoolean
-import kotlin.concurrent.timerTask
 
 @UnlessBuildProfile("test")
 @ApplicationScoped
@@ -53,7 +53,8 @@ class V3Updater @Inject constructor(
 ) : Updater {
 
     private val mutex = Mutex()
-    private val toUpdate: ConcurrentSkipListSet<String> = ConcurrentSkipListSet<String>()
+    private val toUpdate = ConcurrentLinkedQueue<String>()
+    private var executor: ScheduledExecutorService? = null
 
     companion object {
         @JvmStatic
@@ -107,55 +108,49 @@ class V3Updater @Inject constructor(
             .toList()
 
         if (toUpdateList.isNotEmpty()) {
-            toUpdate.plus(toUpdate)
+            this.toUpdate.add(toUpdate)
         }
 
         return toUpdateList
     }
 
-    private fun incrementalUpdate(oldRepo: AdoptRepos): AdoptRepos? {
-        return runBlocking {
-            // Must catch errors or may kill the scheduler
-            try {
-                LOGGER.info("Starting Incremental update")
-                val toUpdateTmp = HashSet<String>()
-                toUpdateTmp.addAll(toUpdate)
-                toUpdate.clear()
-                val updatedRepo = adoptReposBuilder.incrementalUpdate(
-                    toUpdateTmp,
-                    oldRepo,
-                    database::getGhReleaseMetadata
-                )
-
-                if (updatedRepo != oldRepo) {
-                    val after = writeIncrementalUpdate(updatedRepo, oldRepo)
-                    printRepoDebugInfo(oldRepo, after, null)
-                    return@runBlocking after
+    internal suspend fun incrementalUpdate(oldRepo: AdoptRepos): AdoptRepos? {
+        val requests = generateSequence { toUpdate.poll() }.toSet()
+        try {
+            LOGGER.info("Starting Incremental update")
+            val after = adoptReposBuilder.incrementalUpdateAndPublish(requests, oldRepo, database::getGhReleaseMetadata) { proposed ->
+                if (proposed == oldRepo) proposed else {
+                    writeIncrementalUpdate(proposed, oldRepo).also { accepted ->
+                        if (accepted != proposed) toUpdate.addAll(requests)
+                    }
                 }
-            } catch (e: Exception) {
-                LOGGER.error("Failed to perform incremental update", e)
             }
-            return@runBlocking null
+            if (after != oldRepo) {
+                printRepoDebugInfo(oldRepo, after, null)
+                return after
+            }
+        } catch (e: Exception) {
+            toUpdate.addAll(requests)
+            if (e is CancellationException || e is InterruptedException) throw e
+            LOGGER.error("Failed to perform incremental update", e)
         }
+        return null
     }
 
-    private fun incrementalCdxaUpdate(oldRepo: AdoptCdxaRepos): AdoptCdxaRepos? {
-        return runBlocking {
-            // Must catch errors or may kill the scheduler
-            try {
-                LOGGER.info("Starting Cdxa Incremental update")
-                val updatedRepo = adoptCdxaReposBuilder.incrementalUpdate( oldRepo, database.getCdxaUpdatedAt() )
-
-                if (updatedRepo != oldRepo) {
-                    val after = writeIncrementalCdxaUpdate(updatedRepo, oldRepo)
-                    printCdxaReposDebugInfo(oldRepo, after, null)
-                    return@runBlocking after
-                }
-            } catch (e: Exception) {
-                LOGGER.error("Failed to perform incremental cdxa update", e)
+    internal suspend fun incrementalCdxaUpdate(oldRepo: AdoptCdxaRepos): AdoptCdxaRepos? {
+        try {
+            LOGGER.info("Starting Cdxa Incremental update")
+            val updatedRepo = adoptCdxaReposBuilder.incrementalUpdate(oldRepo, database.getCdxaUpdatedAt())
+            if (updatedRepo != oldRepo) {
+                val after = writeIncrementalCdxaUpdate(updatedRepo, oldRepo)
+                printCdxaReposDebugInfo(oldRepo, after, null)
+                return after
             }
-            return@runBlocking null
+        } catch (e: Exception) {
+            if (e is CancellationException || e is InterruptedException) throw e
+            LOGGER.error("Failed to perform incremental cdxa update", e)
         }
+        return null
     }
 
     private fun printRepoDebugInfo(
@@ -326,14 +321,12 @@ class V3Updater @Inject constructor(
         }
     }
 
+    @Synchronized
     fun run(instantFullUpdate: Boolean) {
+        check(executor == null) { "Updater is already running" }
         assertConnectedToDb()
 
-        val executor = Executors.newScheduledThreadPool(2)
-
-        val delay = if (instantFullUpdate) 0L else 1L
-
-        var repo: AdoptRepos = try {
+        val repo: AdoptRepos = try {
             apiDataStore.loadDataFromDb(true)
         } catch (e: java.lang.Exception) {
             LOGGER.error("Failed to load db", e)
@@ -345,7 +338,7 @@ class V3Updater @Inject constructor(
             AdoptRepos(emptyList())
         }
 
-        var cdxaRepo: AdoptCdxaRepos = try {
+        val cdxaRepo: AdoptCdxaRepos = try {
             apiDataStore.loadCdxaDataFromDb(true)
         } catch (e: java.lang.Exception) {
             LOGGER.error("Failed to load cdxa db", e)
@@ -357,59 +350,55 @@ class V3Updater @Inject constructor(
             AdoptCdxaRepos(emptyList())
         } 
 
-        val incrementalUpdateScheduled = AtomicBoolean(false)
-        val incrementalCdxaUpdateScheduled = AtomicBoolean(false)
-
-        executor.scheduleWithFixedDelay(
-            timerTask {
-                try {
-                    runUpdate(repo, incrementalUpdateScheduled, executor)
-                    runCdxaUpdate(cdxaRepo, incrementalCdxaUpdateScheduled, executor)
-                } catch (e: InvalidUpdateException) {
-                    LOGGER.error("Failed to perform update", e)
-                }
-            },
-            delay, 1, TimeUnit.DAYS
-        )
+        // This worker owns scheduled snapshots through fetching and publication.
+        val worker = Executors.newSingleThreadScheduledExecutor()
+        executor = worker
+        scheduleUpdates(repo, cdxaRepo, instantFullUpdate, worker)
     }
 
-    fun runUpdate(
-        repo: AdoptRepos,
-        incrementalUpdateScheduled: AtomicBoolean,
-        executor: ScheduledExecutorService
-    ): AdoptRepos {
+    internal fun scheduleUpdates(
+        initialRepo: AdoptRepos,
+        initialCdxaRepo: AdoptCdxaRepos,
+        instantFullUpdate: Boolean,
+        worker: ScheduledExecutorService
+    ) {
+        var repo = initialRepo
+        var cdxaRepo = initialCdxaRepo
+        var incrementalScheduled = false
+        worker.scheduleWithFixedDelay({
+            repo = runUpdate(repo)
+            cdxaRepo = runCdxaUpdate(cdxaRepo)
+            if (!incrementalScheduled) {
+                worker.scheduleWithFixedDelay({
+                    runBlocking {
+                        repo = incrementalUpdate(repo) ?: repo
+                        cdxaRepo = incrementalCdxaUpdate(cdxaRepo) ?: cdxaRepo
+                    }
+                }, 1, 6, TimeUnit.MINUTES)
+                incrementalScheduled = true
+            }
+        }, if (instantFullUpdate) 0 else 1, 1, TimeUnit.DAYS)
+    }
+
+    @PreDestroy
+    @Synchronized
+    fun stop() {
+        executor?.shutdownNow()
+    }
+
+    fun runUpdate(repo: AdoptRepos): AdoptRepos = runBlocking {
         var repo1 = repo
         repo1 = fullUpdate(repo1, true) ?: repo1
         repo1 = incrementalUpdate(repo1) ?: repo1
-        if (!incrementalUpdateScheduled.getAndSet(true)) {
-            executor.scheduleWithFixedDelay(
-                timerTask {
-                    repo1 = incrementalUpdate(repo1) ?: repo1
-                },
-                1, 6, TimeUnit.MINUTES
-            )
-        }
         repo1 = fullUpdate(repo1, false) ?: repo1
-        return repo1
+        repo1
     }
 
-    fun runCdxaUpdate(
-        repo: AdoptCdxaRepos,
-        incrementalCdxaUpdateScheduled: AtomicBoolean,
-        executor: ScheduledExecutorService
-    ): AdoptCdxaRepos {
+    fun runCdxaUpdate(repo: AdoptCdxaRepos): AdoptCdxaRepos = runBlocking {
         var repo1 = repo
         repo1 = fullCdxaUpdate(repo1) ?: repo1
         repo1 = incrementalCdxaUpdate(repo1) ?: repo1
-        if (!incrementalCdxaUpdateScheduled.getAndSet(true)) {
-            executor.scheduleWithFixedDelay(
-                timerTask {
-                    repo1 = incrementalCdxaUpdate(repo1) ?: repo1
-                },
-                1, 6, TimeUnit.MINUTES
-            )
-        }
-        return repo1
+        repo1
     }
 
     private fun assertConnectedToDb() {
@@ -430,53 +419,41 @@ class V3Updater @Inject constructor(
     }
 
     @Throws(InvalidUpdateException::class)
-    private fun fullUpdate(currentRepo: AdoptRepos, releasesOnly: Boolean): AdoptRepos? {
+    private suspend fun fullUpdate(currentRepo: AdoptRepos, releasesOnly: Boolean): AdoptRepos? {
         // Must catch errors or may kill the scheduler
         try {
-            return runBlocking {
-                LOGGER.info("Starting Full update {}", releasesOnly)
+            LOGGER.info("Starting Full update {}", releasesOnly)
 
-                updatableVersionSupplier.updateVersions()
+            updatableVersionSupplier.updateVersions()
 
-                val filterType: ReleaseFilterType = if (releasesOnly) {
-                    ReleaseFilterType.RELEASES_ONLY
-                } else {
-                    ReleaseFilterType.ALL
+            val filterType = if (releasesOnly) ReleaseFilterType.RELEASES_ONLY else ReleaseFilterType.ALL
+            val filter = ReleaseIncludeFilter(TimeSource.now(), filterType)
+            val newRepoData = adoptReposBuilder.build(filter)
+            val repo = copyOldReleasesIntoNewRepo(currentRepo, newRepoData, filter)
+
+            printRepoDebugInfo(currentRepo, repo, null)
+            val checksum = calculateChecksum(repo)
+
+            val dataInDb = mutex.withLock {
+                if (!validateStats(repo)) {
+                    LOGGER.error("Stats do not look correct, not saving update")
+                    throw InvalidUpdateException("Stats are not sane")
                 }
 
-                val filter = ReleaseIncludeFilter(TimeSource.now(), filterType)
-
-                val newRepoData = adoptReposBuilder.build(filter)
-
-                val repo = copyOldReleasesIntoNewRepo(currentRepo, newRepoData, filter)
-
-                printRepoDebugInfo(currentRepo, repo, null)
-
-                val checksum = calculateChecksum(repo)
-
-                val dataInDb = mutex.withLock {
-                    runBlocking {
-                        if (!validateStats(repo)) {
-                            LOGGER.error("Stats do not look correct, not saving update")
-                            throw InvalidUpdateException("Stats are not sane")
-                        }
-
-                        database.updateAllRepos(repo, checksum)
-                        statsInterface.update(repo)
-                        database.setReleaseInfo(releaseVersionResolver.formReleaseInfo(repo))
-                        apiDataStore.loadDataFromDb(forceUpdate = true, logEntries = false)
-                    }
-                }
-
-                LOGGER.info("Updating Release Notes")
-                adoptReleaseNotes.updateReleaseNotes(repo)
-
-                printRepoDebugInfo(currentRepo, repo, dataInDb)
-
-                LOGGER.info("Full update done")
-                return@runBlocking repo
+                database.updateAllRepos(repo, checksum)
+                statsInterface.update(repo)
+                database.setReleaseInfo(releaseVersionResolver.formReleaseInfo(repo))
+                apiDataStore.loadDataFromDb(forceUpdate = true, logEntries = false)
             }
+
+            LOGGER.info("Updating Release Notes")
+            adoptReleaseNotes.updateReleaseNotes(repo)
+
+            printRepoDebugInfo(currentRepo, repo, dataInDb)
+            LOGGER.info("Full update done")
+            return repo
         } catch (e: Exception) {
+            if (e is CancellationException || e is InterruptedException) throw e
             LOGGER.error("Failed to perform full update", e)
         } catch (e: Throwable) {
             // Log and rethrow, may be unrecoverable error such as OutOfMemoryError
@@ -487,34 +464,31 @@ class V3Updater @Inject constructor(
     }
 
     @Throws(InvalidUpdateException::class)
-    private fun fullCdxaUpdate(currentRepo: AdoptCdxaRepos): AdoptCdxaRepos? {
+    private suspend fun fullCdxaUpdate(currentRepo: AdoptCdxaRepos): AdoptCdxaRepos? {
         // Must catch errors or may kill the scheduler
         try {
-            return runBlocking {
-                LOGGER.info("Starting Full Cdxa update")
+            LOGGER.info("Starting Full Cdxa update")
 
-                updatableVersionSupplier.updateVersions()
+            updatableVersionSupplier.updateVersions()
 
-                val repo = adoptCdxaReposBuilder.build()
+            val repo = adoptCdxaReposBuilder.build()
 
-                printCdxaReposDebugInfo(currentRepo, repo, null)
+            printCdxaReposDebugInfo(currentRepo, repo, null)
 
-                val checksum = calculateCdxaChecksum(repo)
+            val checksum = calculateCdxaChecksum(repo)
 
-                val dataInDb = mutex.withLock {
-                    runBlocking {
-                        database.updateCdxaRepos(repo, checksum)
+            val dataInDb = mutex.withLock {
+                database.updateCdxaRepos(repo, checksum)
 
-                        apiDataStore.loadCdxaDataFromDb(forceUpdate = true, logEntries = true)
-                    }
-                }
-
-                printCdxaReposDebugInfo(currentRepo, repo, dataInDb)
-
-                LOGGER.info("Full Cdxa update done")
-                return@runBlocking repo
+                apiDataStore.loadCdxaDataFromDb(forceUpdate = true, logEntries = true)
             }
+
+            printCdxaReposDebugInfo(currentRepo, repo, dataInDb)
+
+            LOGGER.info("Full Cdxa update done")
+            return repo
         } catch (e: Exception) {
+            if (e is CancellationException || e is InterruptedException) throw e
             LOGGER.error("Failed to perform full Cdxa update", e)
         } catch (e: Throwable) {
             // Log and rethrow, may be unrecoverable error such as OutOfMemoryError

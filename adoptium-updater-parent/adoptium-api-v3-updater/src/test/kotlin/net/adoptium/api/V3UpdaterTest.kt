@@ -104,8 +104,12 @@ class V3UpdaterTest {
                 vs
             )
 
-            updater.run(true)
-            assertTrue(called.get())
+            try {
+                updater.run(true)
+                assertTrue(called.get())
+            } finally {
+                updater.stop()
+            }
         }
     }
 
@@ -268,7 +272,7 @@ class V3UpdaterTest {
                 vs
             )
 
-            var updatedRepo = updater.runUpdate(repo, AtomicBoolean(true), mockk())
+            var updatedRepo = updater.runUpdate(repo)
 
             assertTrue(updatedRepo == repo)
             assertTrue(updatedRepo !== repo)

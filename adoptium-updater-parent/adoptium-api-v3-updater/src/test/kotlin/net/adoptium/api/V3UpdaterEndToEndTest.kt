@@ -66,7 +66,6 @@ import net.adoptium.api.v3.stats.StatsInterface
 import net.adoptium.api.v3.stats.dockerstats.DockerStatsInterfaceFactory
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
-import java.util.concurrent.atomic.AtomicBoolean
 import org.slf4j.LoggerFactory
 import java.time.Instant
 import java.time.temporal.ChronoUnit
@@ -637,7 +636,7 @@ class V3UpdaterEndToEndTest {
             vs
         )
 
-        val updatedRepo = updater.runUpdate(repo, AtomicBoolean(true), mockk())
+        val updatedRepo = updater.runUpdate(repo)
         return updatedRepo
     }
 
@@ -754,7 +753,7 @@ class V3UpdaterEndToEndTest {
             vs
         )
 
-        val updatedCdxaRepo = updater.runCdxaUpdate(cdxaRepo, AtomicBoolean(true), mockk())
+        val updatedCdxaRepo = updater.runCdxaUpdate(cdxaRepo)
         return updatedCdxaRepo
     }
 

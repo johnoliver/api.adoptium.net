@@ -3,9 +3,9 @@ package net.adoptium.api.v3
 import jakarta.enterprise.context.ApplicationScoped
 import jakarta.inject.Inject
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.Deferred
-import kotlinx.coroutines.GlobalScope
 import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import net.adoptium.api.v3.dataSources.github.GitHubApi
 import net.adoptium.api.v3.dataSources.github.graphql.models.GHAsset
 import net.adoptium.api.v3.dataSources.github.graphql.models.GHRelease
@@ -104,7 +104,6 @@ open class AdoptRepositoryImpl @Inject constructor(
             filter,
             getRepository(filter)
         )
-            .await()
             .filterNotNull()
             .map { AdoptRepo(it) }
 
@@ -115,8 +114,10 @@ open class AdoptRepositoryImpl @Inject constructor(
         val releaseSummaries = getDataForEachRepo(
             version,
             ReleaseIncludeFilter.INCLUDE_ALL
-        ) { _: Vendor, owner: String, repoName: String -> client.getRepositorySummary(owner, repoName) }
-            .await()
+        ) { vendor: Vendor, owner: String, repoName: String ->
+            val summary = client.getRepositorySummary(owner, repoName)
+            summary.copy(releases = summary.releases.copy(releases = summary.releases.releases.map { it.copy(vendor = vendor) }))
+        }
             .filterNotNull()
             .flatMap { it.releases.releases }
             .toList()
@@ -151,47 +152,28 @@ open class AdoptRepositoryImpl @Inject constructor(
             }
     }
 
-    private fun <E> getDataForEachRepo(
+    private suspend fun <E> getDataForEachRepo(
         version: Int,
         filter: ReleaseIncludeFilter,
         getFun: suspend (Vendor, String, String) -> E
-    ): Deferred<List<E?>> {
+    ): List<E> = coroutineScope {
         LOGGER.info("getting $version")
-        return GlobalScope.async {
-
-            return@async listOf(
-                getRepoDataAsync(ADOPT_ORG, Vendor.adoptopenjdk, "openjdk$version-openj9-releases", getFun, filter),
-                getRepoDataAsync(ADOPT_ORG, Vendor.adoptopenjdk, "openjdk$version-openj9-nightly", getFun, filter),
-                getRepoDataAsync(ADOPT_ORG, Vendor.adoptopenjdk, "openjdk$version-nightly", getFun, filter),
-                getRepoDataAsync(ADOPT_ORG, Vendor.adoptopenjdk, "openjdk$version-binaries", getFun, filter),
-
-                getRepoDataAsync(ADOPT_ORG, Vendor.openjdk, "openjdk$version-upstream-binaries", getFun, filter),
-
-                getRepoDataAsync(ADOPT_ORG, Vendor.alibaba, "openjdk$version-dragonwell-binaries", getFun, filter),
-
-                getRepoDataAsync(ADOPTIUM_ORG, Vendor.eclipse, "temurin$version-binaries", getFun, filter),
-
-                getRepoDataAsync(ADOPT_ORG, Vendor.ibm, "semeru$version-binaries", getFun, filter)
-            )
-                .map { repo -> repo.await() }
-        }
-    }
-
-    private fun <E> getRepoDataAsync(
-        owner: String,
-        vendor: Vendor,
-        repoName: String,
-        getFun: suspend (Vendor, String, String) -> E,
-        filter: ReleaseIncludeFilter
-    ): Deferred<E?> {
-        return GlobalScope.async {
-            if (!Vendor.validVendor(vendor) || !filter.filterVendor(vendor)) {
-                return@async null
+        listOf(
+            Triple(ADOPT_ORG, Vendor.adoptopenjdk, "openjdk$version-openj9-releases"),
+            Triple(ADOPT_ORG, Vendor.adoptopenjdk, "openjdk$version-openj9-nightly"),
+            Triple(ADOPT_ORG, Vendor.adoptopenjdk, "openjdk$version-nightly"),
+            Triple(ADOPT_ORG, Vendor.adoptopenjdk, "openjdk$version-binaries"),
+            Triple(ADOPT_ORG, Vendor.openjdk, "openjdk$version-upstream-binaries"),
+            Triple(ADOPT_ORG, Vendor.alibaba, "openjdk$version-dragonwell-binaries"),
+            Triple(ADOPTIUM_ORG, Vendor.eclipse, "temurin$version-binaries"),
+            Triple(ADOPT_ORG, Vendor.ibm, "semeru$version-binaries")
+        ).filter { (_, vendor, _) -> Vendor.validVendor(vendor) && filter.filterVendor(vendor) }
+            .map { (owner, vendor, repoName) ->
+                async {
+                    LOGGER.info("getting $owner $repoName")
+                    getFun(vendor, owner, repoName).also { LOGGER.info("Done getting $owner $repoName") }
+                }
             }
-            LOGGER.info("getting $owner $repoName")
-            val releases = getFun(vendor, owner, repoName)
-            LOGGER.info("Done getting $owner $repoName")
-            return@async releases
-        }
+            .awaitAll()
     }
 }
