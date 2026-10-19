@@ -56,6 +56,7 @@ import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.params.ParameterizedTest
+import org.junit.jupiter.params.provider.CsvSource
 import org.junit.jupiter.params.provider.ValueSource
 import tools.jackson.databind.json.JsonMapper
 import java.time.format.DateTimeFormatter
@@ -108,12 +109,13 @@ class ReleaseSnapshotTest {
             ReleaseVersionResolver(versions), mockk(relaxed = true), versions)
 
     @ParameterizedTest
-    @ValueSource(strings = ["null-response", "missing-data", "missing-node", "decode"])
-    fun `failed second asset page preserves every split and aborts full publication`(failure: String) = runBlocking {
-        val complete = upstream()
+    @CsvSource("null-response,false", "missing-data,false", "missing-node,false", "decode,false",
+        "null-response,true", "missing-data,true", "missing-node,true", "decode,true")
+    fun `failed second asset page preserves every split but only GA aborts full publication`(failure: String, ea: Boolean) = runBlocking {
+        val complete = upstream().copy(isPrerelease = ea)
         val factory = factory(client())
         val previous = repos(factory.get(Vendor.eclipse).toAdoptRelease(complete).result!!)
-        val prefix = upstream(listOf(first, "$first.json"))
+        val prefix = upstream(listOf(first, "$first.json")).copy(isPrerelease = ea)
         // A complete pair on the retained page maps successfully, but is not a complete snapshot.
         assertTrue(factory.get(Vendor.eclipse).toAdoptRelease(prefix).succeeded())
         val paged = prefix.copy(releaseAssets = prefix.releaseAssets.copy(pageInfo = PageInfo(true, "page-two")))
@@ -158,18 +160,22 @@ class ReleaseSnapshotTest {
         val versions = versions()
         val builder = AdoptReposBuilder(AdoptRepositoryImpl(github, factory), versions)
         assertEquals(nodes(previous), nodes(builder.incrementalUpdate(setOf(complete.name), previous) { null }))
-        val error = assertThrows(Exception::class.java) { runBlocking { builder.build(ReleaseIncludeFilter.INCLUDE_ALL) } }
-        assertTrue(error.message!!.contains(when (failure) {
-            "null-response" -> "GraphQL page unavailable"
-            "missing-data" -> "No data returned"
-            "missing-node" -> "Release asset page unavailable"
-            else -> "Unable to decode GraphQL page"
-        }))
+        if (ea) {
+            assertEquals(nodes(previous), nodes(builder.build(ReleaseIncludeFilter.INCLUDE_ALL, previous)))
+        } else {
+            val error = assertThrows(Exception::class.java) { runBlocking { builder.build(ReleaseIncludeFilter.INCLUDE_ALL, previous) } }
+            assertTrue(error.message!!.contains(when (failure) {
+                "null-response" -> "GraphQL page unavailable"
+                "missing-data" -> "No data returned"
+                "missing-node" -> "Release asset page unavailable"
+                else -> "Unable to decode GraphQL page"
+            }))
+        }
         val database = spyk(InMemoryApiPersistence(previous, mockk()))
         assertNull(database.getLatestGithubStatsForFeatureVersion(8))
         updater(builder, database, versions).runUpdate(previous, AtomicBoolean(true), mockk())
         assertEquals(nodes(previous), nodes(database.repos))
-        coVerify(exactly = 0) { database.updateAllRepos(any(), any()) }
+        if (!ea) coVerify(exactly = 0) { database.updateAllRepos(any(), any()) }
     }
 
     @ParameterizedTest

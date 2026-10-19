@@ -5,6 +5,7 @@ package net.adoptium.api.v3.dataSources.github.graphql.clients
 import com.expediagroup.graphql.client.types.GraphQLClientRequest
 import jakarta.enterprise.context.ApplicationScoped
 import jakarta.inject.Inject
+import kotlinx.coroutines.CancellationException
 import net.adoptium.api.v3.dataSources.github.graphql.models.GHRelease
 import net.adoptium.api.v3.dataSources.github.graphql.models.GHReleases
 import net.adoptium.api.v3.dataSources.github.graphql.models.GHRepository
@@ -57,7 +58,15 @@ open class GraphQLGitHubRepositoryClient @Inject constructor(
             }
             .map { release ->
                 if (release.releaseAssets.pageInfo.hasNextPage) {
-                    graphQLGitHubReleaseRequest.getAllReleaseAssets(release)
+                    try {
+                        graphQLGitHubReleaseRequest.getAllReleaseAssets(release)
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        if (!release.isEarlyAccess()) throw e
+                        LOGGER.warn("Incomplete EA asset pages for ${release.url}; retaining the incomplete marker", e)
+                        release
+                    }
                 } else {
                     release
                 }

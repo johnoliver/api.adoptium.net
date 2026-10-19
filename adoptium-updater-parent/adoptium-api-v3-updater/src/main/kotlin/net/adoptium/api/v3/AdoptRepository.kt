@@ -23,7 +23,7 @@ import net.adoptium.api.v3.models.Vendor
 import org.slf4j.LoggerFactory
 
 interface AdoptRepository {
-    suspend fun getRelease(version: Int, filter: ReleaseIncludeFilter): FeatureRelease?
+    suspend fun getRelease(version: Int, filter: ReleaseIncludeFilter, previous: List<Release> = emptyList()): FeatureRelease?
     suspend fun getSummary(version: Int): GHRepositorySummary
     suspend fun getReleaseById(gitHubId: GitHubId): ReleaseResult?
     suspend fun getReleaseFilesForId(gitHubId: GitHubId): List<GHAsset>?
@@ -42,8 +42,6 @@ open class AdoptRepositoryImpl @Inject constructor(
 
         @JvmStatic
         private val LOGGER = LoggerFactory.getLogger(this::class.java)
-
-        private val EXCLUDED = listOf("jdk17u-2022-05-27-19-32-beta", "jdk-11.0.13'+8")
     }
 
     private val mappers = mapOf(
@@ -84,8 +82,11 @@ open class AdoptRepositoryImpl @Inject constructor(
     private suspend fun mapRelease(release: GHRelease): ReleaseResult {
         // These known malformed upstream tags are permanent policy exclusions,
         // unlike unavailable metadata or a mapping failure that can recover.
-        if (release.name in EXCLUDED) {
+        if (ReleaseExclusions.isExcluded(release.url, release.name)) {
             return ReleaseResult(error = "Excluded upstream tag ${release.name}", retryable = false)
+        }
+        if (release.releaseAssets.pageInfo.hasNextPage) {
+            return ReleaseResult(error = "Incomplete asset pages for ${release.name}")
         }
         return getMapperForRepo(release.url).toAdoptRelease(release)
     }
@@ -97,12 +98,12 @@ open class AdoptRepositoryImpl @Inject constructor(
             ?.assets
     }
 
-    override suspend fun getRelease(version: Int, filter: ReleaseIncludeFilter): FeatureRelease {
-
+    override suspend fun getRelease(version: Int, filter: ReleaseIncludeFilter, previous: List<Release>): FeatureRelease {
+        val snapshots = previous.groupBy { GitHubId(it.id) }
         val repo = getDataForEachRepo(
             version,
             filter,
-            getRepository(filter)
+            { vendor, owner, repoName -> getRepository(filter, vendor, owner, repoName, snapshots) }
         )
             .await()
             .filterNotNull()
@@ -115,19 +116,21 @@ open class AdoptRepositoryImpl @Inject constructor(
         val releaseSummaries = getDataForEachRepo(
             version,
             ReleaseIncludeFilter.INCLUDE_ALL
-        ) { _: Vendor, owner: String, repoName: String -> client.getRepositorySummary(owner, repoName) }
+        ) { _: Vendor, owner: String, repoName: String ->
+            client.getRepositorySummary(owner, repoName).releases.releases.filterNot {
+                ReleaseExclusions.isExcluded("https://github.com/$owner/$repoName/releases/", it.name)
+            }
+        }
             .await()
             .filterNotNull()
-            .flatMap { it.releases.releases }
-            .toList()
+            .flatten()
         return GHRepositorySummary(GHReleasesSummary(releaseSummaries, PageInfo(false, "")))
     }
 
-    private fun getRepository(filter: ReleaseIncludeFilter): suspend (Vendor, String, String) -> List<Release> {
-        return { vendor: Vendor, owner: String, repoName: String -> getRepository(filter, vendor, owner, repoName) }
-    }
-
-    private suspend fun getRepository(filter: ReleaseIncludeFilter, vendor: Vendor, owner: String, repoName: String): List<Release> {
+    private suspend fun getRepository(
+        filter: ReleaseIncludeFilter, vendor: Vendor, owner: String, repoName: String,
+        previous: Map<GitHubId, List<Release>>
+    ): List<Release> {
         return client
             .getRepository(owner, repoName) { updatedAt, isPrerelease -> filter.filter(vendor, updatedAt, isPrerelease) }
             .getReleases()
@@ -144,8 +147,11 @@ open class AdoptRepositoryImpl @Inject constructor(
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: Exception) {
-                    // A full rebuild has no previous snapshots to merge with.
-                    // Abort rather than publishing an incomplete replacement.
+                    if (it.isEarlyAccess()) {
+                        LOGGER.warn("Failed to refresh EA ${it.url}; retaining its previous snapshot", e)
+                        return@flatMap previous[it.id].orEmpty()
+                    }
+                    // GA failures still abort rather than publishing incomplete data.
                     throw IllegalStateException("Failed to map release ${it.id.id}", e)
                 }
             }

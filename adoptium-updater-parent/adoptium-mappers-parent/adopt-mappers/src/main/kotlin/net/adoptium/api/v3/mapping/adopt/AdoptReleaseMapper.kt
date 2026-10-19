@@ -28,7 +28,6 @@ import org.slf4j.LoggerFactory
 import java.security.MessageDigest
 import java.time.ZonedDateTime
 import java.util.*
-import java.util.regex.Pattern
 
 @ApplicationScoped
 open class AdoptReleaseMapperFactory @Inject constructor(
@@ -59,7 +58,7 @@ private class AdoptReleaseMapper(
     }
 
     override suspend fun toAdoptRelease(ghRelease: GHRelease): ReleaseResult {
-        val releaseType: ReleaseType = formReleaseType(ghRelease)
+        val releaseType = if (ghRelease.isEarlyAccess()) ReleaseType.ea else ReleaseType.ga
 
         val releaseLink = ghRelease.url
         val releaseName = ghRelease.name
@@ -104,18 +103,16 @@ private class AdoptReleaseMapper(
                     toRelease(releaseName, ghAssets, ghAssetsWithMetadata, id, releaseType, releaseLink, timestamp, updatedAt, vendor, version, ghRelease.releaseAssets.assets, sourcePackage, releaseNotes, aqavitResultsLink, if (index == 0) ungroupedDownloads else 0)
                 }
                 .ifEmpty {
-                    try {
-                        // if we have no metadata resort to parsing release names
-                        val version = parseVersionInfo(ghRelease, releaseName)
-                        val ghAssets = supportedAssets
-                        val id = ghRelease.id.id
-
-                        return@ifEmpty listOf(toRelease(releaseName, ghAssets, ghAssetsWithMetadata, id, releaseType, releaseLink, timestamp, updatedAt, vendor, version, ghRelease.releaseAssets.assets, sourcePackage, releaseNotes, aqavitResultsLink, ungroupedDownloads))
-                    } catch (e: CancellationException) {
-                        throw e
-                    } catch (e: Exception) {
-                        throw FailedToParse("Failed to parse version $releaseName", e)
+                    // Date-based EA names are valid when metadata supplies their
+                    // version. Only exclude them after that path is exhausted.
+                    val version = try {
+                        VersionParser.parse(releaseName)
+                    } catch (e: FailedToParse) {
+                        if (releaseType != ReleaseType.ea) throw e
+                        LOGGER.warn("Excluding EA with no parseable version: $releaseLink")
+                        return ReleaseResult(error = "Unparseable EA version $releaseName", retryable = false)
                     }
+                    listOf(toRelease(releaseName, supportedAssets, ghAssetsWithMetadata, ghRelease.id.id, releaseType, releaseLink, timestamp, updatedAt, vendor, version, ghRelease.releaseAssets.assets, sourcePackage, releaseNotes, aqavitResultsLink, ungroupedDownloads))
                 }
                 .filter { updatedRelease -> !excludeRelease(ghRelease, updatedRelease) }
 
@@ -221,41 +218,6 @@ private class AdoptReleaseMapper(
         .filter { asset -> BinaryMapper.BINARY_EXTENSIONS.any { asset.name.endsWith(it) } }
         .sumOf { it.downloadCount }
 
-    private fun formReleaseType(release: GHRelease): ReleaseType {
-        // TODO fix me before the year 2100
-        val dateMatcher =
-            """.*(20[0-9]{2}-[0-9]{2}-[0-9]{2}|20[0-9]{6}).*"""
-        val hasDate = Pattern.compile(dateMatcher).matcher(release.name)
-
-        return if (release.url.matches(Regex(".*/(temurin|openjdk|semeru)[0-9]+-binaries/.*"))) {
-            // Can trust isPrerelease from -binaries repos
-            if (release.isPrerelease) {
-                ReleaseType.ea
-            } else {
-                ReleaseType.ga
-            }
-        } else {
-            if (hasDate.matches()) {
-                ReleaseType.ea
-            } else {
-                ReleaseType.ga
-            }
-        }
-    }
-
-    private fun parseVersionInfo(release: GHRelease, release_name: String): VersionData {
-        return try {
-            VersionParser.parse(release_name)
-        } catch (e: FailedToParse) {
-            try {
-                getFeatureVersion(release)
-            } catch (e: Exception) {
-                LOGGER.warn("Failed to parse ${release.name}")
-                throw e
-            }
-        }
-    }
-
     private suspend fun associateMetadataWithBinaries(releaseAssets: GHAssets, supportedAssets: List<GHAsset>): Map<GHAsset, GHMetaData> {
         val sources = releaseAssets.assets.filter { it.name.contains("-sources") && it.name.endsWith(".tar.gz") }
         val candidates = supportedAssets + sources
@@ -284,9 +246,6 @@ private class AdoptReleaseMapper(
         }
     }
 
-    private fun getFeatureVersion(release: GHRelease): VersionData {
-        return VersionParser.parse(release.name)
-    }
 
     private fun getSourcePackage(release: GHRelease, ghAssetsWithMetadata: Map<GHAsset, GHMetaData>): SourcePackage? {
         val sources = ghAssetsWithMetadata

@@ -87,13 +87,13 @@ class V3Updater @Inject constructor(
             return String(Base64.getEncoder().encode(md.digest()))
         }
 
-        fun copyOldReleasesIntoNewRepo(currentRepo: AdoptRepos, newRepoData: AdoptRepos, filter: ReleaseIncludeFilter) = currentRepo
+        fun copyOldReleasesIntoNewRepo(currentRepo: AdoptRepos, newRepoData: AdoptRepos, filter: ReleaseIncludeFilter) = ReleaseExclusions.removeExcluded(currentRepo
             .removeReleases { vendor, startTime, isPrerelease -> filter.filter(vendor, startTime, isPrerelease) }
             .addAll(newRepoData
                 .allReleases
                 .getReleases()
                 .toList()
-            )
+            ))
     }
 
     override fun addToUpdate(toUpdate: String): List<Release> {
@@ -446,7 +446,7 @@ class V3Updater @Inject constructor(
 
                 val filter = ReleaseIncludeFilter(TimeSource.now(), filterType)
 
-                val newRepoData = adoptReposBuilder.build(filter)
+                val newRepoData = adoptReposBuilder.build(filter, currentRepo)
 
                 val repo = copyOldReleasesIntoNewRepo(currentRepo, newRepoData, filter)
 
