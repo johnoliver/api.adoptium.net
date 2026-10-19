@@ -29,7 +29,10 @@ data class GHRelease @JsonCreator constructor(
     @JsonProperty("url") val url: String
 ) {
     @JsonIgnore
-    fun isEarlyAccess(): Boolean = if (url.matches(BINARY_REPOSITORY)) {
+    fun isEarlyAccess(): Boolean = if (url.matches(UPSTREAM_REPOSITORY)) {
+        // Upstream releases identify GA builds by name, not GitHub's prerelease flag.
+        !name.contains(" GA ")
+    } else if (url.matches(BINARY_REPOSITORY)) {
         // Modern binaries repositories maintain GitHub's prerelease flag.
         isPrerelease
     } else {
@@ -38,6 +41,7 @@ data class GHRelease @JsonCreator constructor(
     }
 
     companion object {
+        private val UPSTREAM_REPOSITORY = Regex(".*/openjdk[0-9]+-upstream-binaries/.*")
         private val BINARY_REPOSITORY = Regex(".*/(temurin|openjdk|semeru)[0-9]+-binaries/.*")
         private val DATED_RELEASE = Regex(""".*(20[0-9]{2}-[0-9]{2}-[0-9]{2}|20[0-9]{6}).*""")
     }

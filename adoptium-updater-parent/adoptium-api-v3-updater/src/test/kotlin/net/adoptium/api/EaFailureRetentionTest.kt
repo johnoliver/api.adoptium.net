@@ -36,6 +36,7 @@ import net.adoptium.api.v3.mapping.adopt.AdoptReleaseMapperFactory
 import net.adoptium.api.v3.models.Release
 import net.adoptium.api.v3.models.Vendor
 import org.junit.jupiter.api.Assertions.*
+import org.junit.jupiter.api.Assumptions.assumeTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.params.ParameterizedTest
 import org.junit.jupiter.params.provider.CsvSource
@@ -137,6 +138,53 @@ class EaFailureRetentionTest {
         val recovered = mapper.toAdoptRelease(current).result!!
         val after = builder.build(ReleaseIncludeFilter.INCLUDE_ALL, repos(old + healthy))
         assertEquals((recovered + healthy).associateBy { it.id }, nodes(after))
+    }
+
+    @ParameterizedTest
+    @CsvSource("false,true", "false,false", "true,true", "true,false")
+    fun `upstream classification uses the release name instead of the prerelease flag`(ga: Boolean, prerelease: Boolean) {
+        val upstream = release().copy(
+            name = if (ga) "OpenJDK 11.0.6 GA Release" else "OpenJDK 11.0.6 Early Access Release",
+            isPrerelease = prerelease,
+            url = "https://github.com/AdoptOpenJDK/openjdk11-upstream-binaries/releases/tag/test"
+        )
+        assertEquals(!ga, upstream.isEarlyAccess())
+    }
+
+    @ParameterizedTest
+    @CsvSource("true,exception", "false,exception", "true,parse", "false,parse")
+    fun `upstream mapping failures retain every EA split but abort GA rebuilds`(ea: Boolean, failure: String): Unit = runBlocking {
+        assumeTrue(Vendor.validVendor(Vendor.openjdk))
+        healthyMetadata()
+        val previous = mapper.toAdoptRelease(release()).result!!
+        assertEquals(2, previous.size)
+        val upstream = release().copy(
+            name = if (failure == "parse") {
+                if (ea) "Unparseable Early Access Release" else "Unparseable GA Release"
+            } else {
+                if (ea) "OpenJDK 11.0.6 Early Access Release" else "OpenJDK 11.0.6 GA Release"
+            },
+            isPrerelease = !ea,
+            publishedAt = if (failure == "exception") "invalid date" else time,
+            releaseAssets = GHAssets(emptyList(), PageInfo(false, null)),
+            url = "https://github.com/AdoptOpenJDK/openjdk11-upstream-binaries/releases/tag/test"
+        )
+        val api = mockk<GitHubApi>()
+        coEvery { api.getRepository(any(), any(), any()) } answers {
+            GHRepository(GHReleases(
+                if (secondArg<String>() == "openjdk11-upstream-binaries") listOf(upstream) else emptyList(),
+                PageInfo(false, null)
+            ))
+        }
+        val repository = AdoptRepositoryImpl(api, factory)
+        if (ea) {
+            assertEquals(previous.associateBy { it.id }, repository.getRelease(11, ReleaseIncludeFilter.INCLUDE_ALL, previous).releases.nodes)
+            assertTrue(repository.getRelease(11, ReleaseIncludeFilter.INCLUDE_ALL).releases.nodes.isEmpty())
+        } else {
+            assertThrows(IllegalStateException::class.java) {
+                runBlocking { repository.getRelease(11, ReleaseIncludeFilter.INCLUDE_ALL, previous) }
+            }
+        }
     }
 
     @Test
