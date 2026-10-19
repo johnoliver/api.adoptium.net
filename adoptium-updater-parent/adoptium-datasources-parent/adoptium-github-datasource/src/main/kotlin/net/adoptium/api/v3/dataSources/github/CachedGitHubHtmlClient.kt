@@ -59,7 +59,8 @@ open class CachedGitHubHtmlClient @Inject constructor(
 
     override suspend fun getUrl(url: String): String? {
         val cachedEntry = internalDbStore.getCachedWebpage(url)
-        return if (cachedEntry == null) {
+        return if (cachedEntry == null || cachedEntry.data.isNullOrBlank()) {
+            // A missing body cannot be recovered by conditional validation.
             get(UrlRequest(url))
         } else {
             if (shouldUpdate(cachedEntry)) {
@@ -138,21 +139,31 @@ open class CachedGitHubHtmlClient @Inject constructor(
         for (retryCount in 1..10) {
             try {
                 LOGGER.debug("Getting  ${request.url} ${request.lastModified}")
-                val response = updaterHtmlClient.getFullResponse(request)
+                val response = updaterHtmlClient.getFullResponse(request) ?: return null
 
-                if (response?.statusLine?.statusCode == 304) {
+                if (response.statusLine.statusCode == 304) {
+                    if (request.lastModified == null) {
+                        LOGGER.warn("Ignoring HTTP 304 without a cached body validator for ${request.url}")
+                        return null
+                    }
                     internalDbStore.updateCheckedTime(request.url, TimeSource.now())
                     // asset has not updated
                     return null
                 }
 
+                if (response.statusLine.statusCode != 200 || response.entity == null) return null
                 val body = DefaultUpdaterHtmlClient.extractBody(response)
+                // A failed refresh must not overwrite a usable stale body or
+                // create a durable negative entry.
+                if (body.isNullOrBlank()) return null
 
-                val lastModified = response?.getFirstHeader("Last-Modified")?.value
+                val lastModified = response.getFirstHeader("Last-Modified")?.value
 
                 internalDbStore.putCachedWebpage(request.url, lastModified, TimeSource.now(), body, accessedAt).join()
                 LOGGER.debug("Got ${request.url}")
                 return body
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 LOGGER.error("Failed to read data retrying $retryCount ${request.url}", e)
                 delay(1000)

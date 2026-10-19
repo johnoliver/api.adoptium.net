@@ -93,12 +93,9 @@ class AdoptBinaryMapper @Inject constructor(private val gitHubHtmlClient: GitHub
         val binaryChecksumLink = checksumAsset?.downloadUrl
         val signatureLink = getSignatureLink(fullAssetList, binaryAsset.name)
 
-        val binaryChecksum: String? = binaryAsset.sha256() ?:
-            if (binaryMetadata != null && binaryMetadata.sha256.isNotEmpty()) {
-                binaryMetadata.sha256
-            } else {
-                getChecksum(checksumAsset)
-            }
+        val binaryChecksum = binaryAsset.sha256()
+            ?: binaryMetadata?.sha256?.takeIf { it.isNotEmpty() }
+            ?: getChecksum(checksumAsset)
 
         val metadataLink = getMetadataLink(fullAssetList, binaryName)
 
