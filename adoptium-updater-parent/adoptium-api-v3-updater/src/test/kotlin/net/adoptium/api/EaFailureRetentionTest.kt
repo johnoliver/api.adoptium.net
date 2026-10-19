@@ -259,6 +259,72 @@ class EaFailureRetentionTest {
         assertFalse(json.has("isEarlyAccess"))
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = ["excluded", "retryable"])
+    fun `full publication removes dynamically excluded old splits but retains retryable failures and permits recovery`(failure: String): Unit = runBlocking {
+        healthyMetadata()
+        val oldTime = DateTimeFormatter.ISO_INSTANT.format(TimeSource.now().minusDays(APIConfig.UPDATE_DAY_CUTOFF.toLong() + 2))
+        val original = release().copy(
+            name = "jdk8u-2026-10-01-12-00-beta", publishedAt = oldTime, updatedAt = oldTime,
+            url = "https://github.com/adoptium/temurin8-binaries/releases/tag/ea"
+        )
+        val eclipseMapper = factory.get(Vendor.eclipse)
+        val old = eclipseMapper.toAdoptRelease(original).result!!
+        assertEquals(2, old.size)
+        val unrelated = original.copy(id = GitHubId("ea-other"), url = original.url + "-other")
+        val otherSplits = eclipseMapper.toAdoptRelease(unrelated).result!!
+        val before = repos(old + otherSplits)
+        var current = original.copy(updatedAt = time)
+        if (failure == "excluded") {
+            current = current.copy(releaseAssets = current.releaseAssets.copy(
+                assets = current.releaseAssets.assets.filterNot { it.name.endsWith(".json") }
+            ))
+        } else {
+            coEvery { html.getUrl("$second.json") } returns null
+        }
+        val api = mockk<GitHubApi>()
+        coEvery { api.getRepository(any(), any(), any()) } answers {
+            val include = thirdArg<(String, Boolean) -> Boolean>()
+            GHRepository(GHReleases(
+                if (secondArg<String>() == "temurin8-binaries") listOf(current, unrelated).filter {
+                    include(it.updatedAt, it.isPrerelease)
+                } else emptyList(), PageInfo(false, null)
+            ))
+        }
+        val versions = versions()
+        val builder = spyk(AdoptReposBuilder(AdoptRepositoryImpl(api, factory), versions))
+        // Do not let the incremental pass hide a broken full-publication merge.
+        coEvery { builder.incrementalUpdate(any(), any(), any()) } answers { secondArg<AdoptRepos>() }
+        val database = spyk(InMemoryApiPersistence(before, mockk()))
+        val updater = V3Updater(builder, mockk(), APIDataStoreImpl(database), database, mockk(relaxed = true),
+            ReleaseVersionResolver(versions), mockk(relaxed = true), versions)
+        val updateLegacy = APIConfig.UPDATE_ADOPTOPENJDK
+        try {
+            APIConfig.UPDATE_ADOPTOPENJDK = false
+            val filter = ReleaseIncludeFilter(TimeSource.now(), ReleaseFilterType.ALL)
+            assertFalse(filter.filter(Vendor.eclipse, oldTime, true))
+            assertTrue(filter.filter(Vendor.eclipse, current.updatedAt, true))
+            val excludedIds = java.util.concurrent.ConcurrentHashMap.newKeySet<GitHubId>()
+            val rebuilt = builder.build(filter, before) { excludedIds.add(it) }
+            assertEquals(if (failure == "excluded") setOf(original.id) else emptySet<GitHubId>(), excludedIds)
+            val expected = if (failure == "excluded") otherSplits.associateBy { it.id } else nodes(before)
+            assertEquals(expected, nodes(V3Updater.copyOldReleasesIntoNewRepo(before, rebuilt, filter, excludedIds)))
+            val published = updater.runUpdate(before, AtomicBoolean(true), mockk())
+            assertEquals(expected, nodes(published))
+            assertEquals(expected, nodes(database.repos))
+            coVerify(atLeast = 1) { database.updateAllRepos(any(), any()) }
+
+            healthyMetadata()
+            current = original.copy(updatedAt = time)
+            val recovered = eclipseMapper.toAdoptRelease(current).result!!
+            val afterRecovery = updater.runUpdate(published, AtomicBoolean(true), mockk())
+            assertEquals((recovered + otherSplits).associateBy { it.id }, nodes(afterRecovery))
+            assertEquals(nodes(afterRecovery), nodes(database.repos))
+        } finally {
+            APIConfig.UPDATE_ADOPTOPENJDK = updateLegacy
+        }
+    }
+
     @Test
     fun `full publication removes known exclusions even outside the EA age window`() = runBlocking {
         healthyMetadata()

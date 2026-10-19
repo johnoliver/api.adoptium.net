@@ -66,8 +66,10 @@ class AdoptReleaseNotesTest : BaseTest() {
     }
 
     private fun addReleaseNotesFiles(adoptRepository: AdoptRepository) = object : AdoptRepository {
-        override suspend fun getRelease(version: Int, filter: ReleaseIncludeFilter, previous: List<Release>): FeatureRelease? {
-            return adoptRepository.getRelease(version, filter, previous)
+        override suspend fun getRelease(
+            version: Int, filter: ReleaseIncludeFilter, previous: List<Release>, onExcluded: (GitHubId) -> Unit
+        ): FeatureRelease? {
+            return adoptRepository.getRelease(version, filter, previous, onExcluded)
         }
 
         override suspend fun getSummary(version: Int): GHRepositorySummary {

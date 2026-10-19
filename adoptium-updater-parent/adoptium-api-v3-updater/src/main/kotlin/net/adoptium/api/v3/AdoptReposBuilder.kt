@@ -88,14 +88,17 @@ class AdoptReposBuilder @Inject constructor(
         return ChronoUnit.MINUTES.between(created, TimeSource.now()).absoluteValue > 10
     }
 
-    suspend fun build(filter: ReleaseIncludeFilter, previous: AdoptRepos = AdoptRepos(emptyList())): AdoptRepos {
+    suspend fun build(
+        filter: ReleaseIncludeFilter, previous: AdoptRepos = AdoptRepos(emptyList()),
+        onExcluded: (GitHubId) -> Unit = {}
+    ): AdoptRepos {
         // Fetch repos in parallel
         val reposMap = versionSupplier
             .getAllVersions()
             .reversed()
             .map { version ->
                 val oldReleases = previous.getFeatureRelease(version)?.releases?.nodeList.orEmpty().toList()
-                checkNotNull(adoptRepository.getRelease(version, filter, oldReleases)) { "Incomplete feature release $version" }
+                checkNotNull(adoptRepository.getRelease(version, filter, oldReleases, onExcluded)) { "Incomplete feature release $version" }
             }
             .associateBy { it.featureVersion }
         LOGGER.info("DONE")

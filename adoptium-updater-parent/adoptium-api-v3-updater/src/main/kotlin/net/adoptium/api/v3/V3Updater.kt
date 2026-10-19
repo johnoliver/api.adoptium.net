@@ -18,6 +18,7 @@ import net.adoptium.api.v3.dataSources.UpdatableVersionSupplier
 import net.adoptium.api.v3.dataSources.UpdaterJsonMapper
 import net.adoptium.api.v3.dataSources.models.AdoptRepos
 import net.adoptium.api.v3.dataSources.models.AdoptCdxaRepos
+import net.adoptium.api.v3.dataSources.models.GitHubId
 import net.adoptium.api.v3.dataSources.persitence.ApiPersistence
 import net.adoptium.api.v3.models.Release
 import net.adoptium.api.v3.releaseNotes.AdoptReleaseNotes
@@ -27,6 +28,7 @@ import org.slf4j.LoggerFactory
 import java.io.OutputStream
 import java.security.MessageDigest
 import java.util.*
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentSkipListSet
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
@@ -87,13 +89,16 @@ class V3Updater @Inject constructor(
             return String(Base64.getEncoder().encode(md.digest()))
         }
 
-        fun copyOldReleasesIntoNewRepo(currentRepo: AdoptRepos, newRepoData: AdoptRepos, filter: ReleaseIncludeFilter) = ReleaseExclusions.removeExcluded(currentRepo
+        fun copyOldReleasesIntoNewRepo(
+            currentRepo: AdoptRepos, newRepoData: AdoptRepos, filter: ReleaseIncludeFilter,
+            excludedIds: Set<GitHubId> = emptySet()
+        ) = ReleaseExclusions.removeExcluded(currentRepo
             .removeReleases { vendor, startTime, isPrerelease -> filter.filter(vendor, startTime, isPrerelease) }
             .addAll(newRepoData
                 .allReleases
                 .getReleases()
                 .toList()
-            ))
+            ), excludedIds)
     }
 
     override fun addToUpdate(toUpdate: String): List<Release> {
@@ -446,9 +451,11 @@ class V3Updater @Inject constructor(
 
                 val filter = ReleaseIncludeFilter(TimeSource.now(), filterType)
 
-                val newRepoData = adoptReposBuilder.build(filter, currentRepo)
+                // Repository rebuilds run concurrently; exclusions belong only to this attempt.
+                val excludedIds = ConcurrentHashMap.newKeySet<GitHubId>()
+                val newRepoData = adoptReposBuilder.build(filter, currentRepo) { excludedIds.add(it) }
 
-                val repo = copyOldReleasesIntoNewRepo(currentRepo, newRepoData, filter)
+                val repo = copyOldReleasesIntoNewRepo(currentRepo, newRepoData, filter, excludedIds)
 
                 printRepoDebugInfo(currentRepo, repo, null)
 

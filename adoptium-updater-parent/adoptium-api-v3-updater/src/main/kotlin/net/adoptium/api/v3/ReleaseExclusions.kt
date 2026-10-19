@@ -1,6 +1,7 @@
 package net.adoptium.api.v3
 
 import net.adoptium.api.v3.dataSources.models.AdoptRepos
+import net.adoptium.api.v3.dataSources.models.GitHubId
 
 internal object ReleaseExclusions {
     private val malformedTags = setOf("jdk17u-2022-05-27-19-32-beta", "jdk-11.0.13'+8")
@@ -30,7 +31,7 @@ internal object ReleaseExclusions {
             url.startsWith("https://github.com/adoptium/$repository/releases/") && name in tags
         }
 
-    fun removeExcluded(repo: AdoptRepos): AdoptRepos = repo.allReleases.nodeList
-        .filter { isExcluded(it.release_link, it.release_name) }
+    fun removeExcluded(repo: AdoptRepos, excludedIds: Set<GitHubId> = emptySet()): AdoptRepos = repo.allReleases.nodeList
+        .filter { GitHubId(it.id) in excludedIds || isExcluded(it.release_link, it.release_name) }
         .fold(repo) { current, release -> current.removeRelease(release.version_data.major, release) }
 }

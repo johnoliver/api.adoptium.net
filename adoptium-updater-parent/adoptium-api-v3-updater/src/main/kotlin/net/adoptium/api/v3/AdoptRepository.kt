@@ -23,7 +23,10 @@ import net.adoptium.api.v3.models.Vendor
 import org.slf4j.LoggerFactory
 
 interface AdoptRepository {
-    suspend fun getRelease(version: Int, filter: ReleaseIncludeFilter, previous: List<Release> = emptyList()): FeatureRelease?
+    suspend fun getRelease(
+        version: Int, filter: ReleaseIncludeFilter, previous: List<Release> = emptyList(),
+        onExcluded: (GitHubId) -> Unit = {}
+    ): FeatureRelease?
     suspend fun getSummary(version: Int): GHRepositorySummary
     suspend fun getReleaseById(gitHubId: GitHubId): ReleaseResult?
     suspend fun getReleaseFilesForId(gitHubId: GitHubId): List<GHAsset>?
@@ -98,12 +101,14 @@ open class AdoptRepositoryImpl @Inject constructor(
             ?.assets
     }
 
-    override suspend fun getRelease(version: Int, filter: ReleaseIncludeFilter, previous: List<Release>): FeatureRelease {
+    override suspend fun getRelease(
+        version: Int, filter: ReleaseIncludeFilter, previous: List<Release>, onExcluded: (GitHubId) -> Unit
+    ): FeatureRelease {
         val snapshots = previous.groupBy { GitHubId(it.id) }
         val repo = getDataForEachRepo(
             version,
             filter,
-            { vendor, owner, repoName -> getRepository(filter, vendor, owner, repoName, snapshots) }
+            { vendor, owner, repoName -> getRepository(filter, vendor, owner, repoName, snapshots, onExcluded) }
         )
             .await()
             .filterNotNull()
@@ -129,7 +134,7 @@ open class AdoptRepositoryImpl @Inject constructor(
 
     private suspend fun getRepository(
         filter: ReleaseIncludeFilter, vendor: Vendor, owner: String, repoName: String,
-        previous: Map<GitHubId, List<Release>>
+        previous: Map<GitHubId, List<Release>>, onExcluded: (GitHubId) -> Unit
     ): List<Release> {
         return client
             .getRepository(owner, repoName) { updatedAt, isPrerelease -> filter.filter(vendor, updatedAt, isPrerelease) }
@@ -142,6 +147,7 @@ open class AdoptRepositoryImpl @Inject constructor(
                     } else if (result.retryable) {
                         error("Incomplete snapshot ${it.id.id}: ${result.error}")
                     } else {
+                        onExcluded(it.id)
                         return@flatMap emptyList<Release>()
                     }
                 } catch (e: CancellationException) {
