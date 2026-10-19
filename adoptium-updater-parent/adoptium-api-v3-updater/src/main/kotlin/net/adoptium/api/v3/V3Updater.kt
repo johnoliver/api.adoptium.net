@@ -366,18 +366,35 @@ class V3Updater @Inject constructor(
         var cdxaRepo = initialCdxaRepo
         var incrementalScheduled = false
         worker.scheduleWithFixedDelay({
-            repo = runUpdate(repo)
-            cdxaRepo = runCdxaUpdate(cdxaRepo)
-            if (!incrementalScheduled) {
+            scheduledCycle(worker) {
+                repo = runUpdate(repo)
+                cdxaRepo = runCdxaUpdate(cdxaRepo)
+            }
+            if (!incrementalScheduled && !worker.isShutdown) {
                 worker.scheduleWithFixedDelay({
-                    runBlocking {
-                        repo = incrementalUpdate(repo) ?: repo
-                        cdxaRepo = incrementalCdxaUpdate(cdxaRepo) ?: cdxaRepo
+                    scheduledCycle(worker) {
+                        runBlocking {
+                            repo = incrementalUpdate(repo) ?: repo
+                            cdxaRepo = incrementalCdxaUpdate(cdxaRepo) ?: cdxaRepo
+                        }
                     }
                 }, 1, 6, TimeUnit.MINUTES)
                 incrementalScheduled = true
             }
         }, if (instantFullUpdate) 0 else 1, 1, TimeUnit.DAYS)
+    }
+
+    private fun scheduledCycle(worker: ScheduledExecutorService, update: () -> Unit) {
+        try {
+            update()
+        } catch (e: Exception) {
+            if (e !is CancellationException && e !is InterruptedException) throw e
+            if (worker.isShutdown) throw e
+            // Cancellation belongs to this cycle, not to the recurring job. Clear
+            // a cycle-local interrupt before this still-running worker is reused.
+            Thread.interrupted()
+            LOGGER.warn("Scheduled update cycle cancelled; retrying on the next schedule", e)
+        }
     }
 
     @PreDestroy
@@ -419,7 +436,7 @@ class V3Updater @Inject constructor(
     }
 
     @Throws(InvalidUpdateException::class)
-    private suspend fun fullUpdate(currentRepo: AdoptRepos, releasesOnly: Boolean): AdoptRepos? {
+    internal suspend fun fullUpdate(currentRepo: AdoptRepos, releasesOnly: Boolean): AdoptRepos? {
         // Must catch errors or may kill the scheduler
         try {
             LOGGER.info("Starting Full update {}", releasesOnly)
@@ -428,30 +445,31 @@ class V3Updater @Inject constructor(
 
             val filterType = if (releasesOnly) ReleaseFilterType.RELEASES_ONLY else ReleaseFilterType.ALL
             val filter = ReleaseIncludeFilter(TimeSource.now(), filterType)
-            val newRepoData = adoptReposBuilder.build(filter)
-            val repo = copyOldReleasesIntoNewRepo(currentRepo, newRepoData, filter)
+            return adoptReposBuilder.buildAndPublish(filter) { newRepoData ->
+                val repo = copyOldReleasesIntoNewRepo(currentRepo, newRepoData, filter)
 
-            printRepoDebugInfo(currentRepo, repo, null)
-            val checksum = calculateChecksum(repo)
+                printRepoDebugInfo(currentRepo, repo, null)
+                val checksum = calculateChecksum(repo)
 
-            val dataInDb = mutex.withLock {
-                if (!validateStats(repo)) {
-                    LOGGER.error("Stats do not look correct, not saving update")
-                    throw InvalidUpdateException("Stats are not sane")
+                val dataInDb = mutex.withLock {
+                    if (!validateStats(repo)) {
+                        LOGGER.error("Stats do not look correct, not saving update")
+                        throw InvalidUpdateException("Stats are not sane")
+                    }
+
+                    database.updateAllRepos(repo, checksum)
+                    statsInterface.update(repo)
+                    database.setReleaseInfo(releaseVersionResolver.formReleaseInfo(repo))
+                    apiDataStore.loadDataFromDb(forceUpdate = true, logEntries = false)
                 }
 
-                database.updateAllRepos(repo, checksum)
-                statsInterface.update(repo)
-                database.setReleaseInfo(releaseVersionResolver.formReleaseInfo(repo))
-                apiDataStore.loadDataFromDb(forceUpdate = true, logEntries = false)
+                LOGGER.info("Updating Release Notes")
+                adoptReleaseNotes.updateReleaseNotes(repo)
+
+                printRepoDebugInfo(currentRepo, repo, dataInDb)
+                LOGGER.info("Full update done")
+                repo
             }
-
-            LOGGER.info("Updating Release Notes")
-            adoptReleaseNotes.updateReleaseNotes(repo)
-
-            printRepoDebugInfo(currentRepo, repo, dataInDb)
-            LOGGER.info("Full update done")
-            return repo
         } catch (e: Exception) {
             if (e is CancellationException || e is InterruptedException) throw e
             LOGGER.error("Failed to perform full update", e)

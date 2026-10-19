@@ -157,8 +157,12 @@ class AdoptReposBuilder @Inject constructor(
         return ChronoUnit.MINUTES.between(created, TimeSource.now()).absoluteValue > 10
     }
 
-    suspend fun build(filter: ReleaseIncludeFilter): AdoptRepos = updateMutex.withLock {
-        // Fetch repos in parallel
+    suspend fun build(filter: ReleaseIncludeFilter): AdoptRepos = buildAndPublish(filter) { it }
+
+    internal suspend fun buildAndPublish(
+        filter: ReleaseIncludeFilter,
+        publish: suspend (AdoptRepos) -> AdoptRepos,
+    ): AdoptRepos = updateMutex.withLock {
         val reposMap = versionSupplier
             .getAllVersions()
             .reversed()
@@ -166,7 +170,9 @@ class AdoptReposBuilder @Inject constructor(
                 checkNotNull(adoptRepository.getRelease(version, filter)) { "Incomplete feature release $version" }
             }
             .associateBy { it.featureVersion }
-        // A successful full build starts a new snapshot; failures retain incremental state.
+        // Publication includes validation and merging filtered data with the old snapshot.
+        // Leave retry/completion state intact if any of those steps fails.
+        val accepted = publish(AdoptRepos(reposMap))
         completedOutcomes.clear()
         // A filtered full build may omit historical EAs, so only clear requests
         // for IDs actually refreshed by it. The summary pass prunes deleted IDs.
@@ -174,6 +180,6 @@ class AdoptReposBuilder @Inject constructor(
             pendingRefreshes[version]?.removeAll(feature.releases.nodes.values.map { GitHubId(it.id) }.toSet())
         }
         LOGGER.info("DONE")
-        AdoptRepos(reposMap)
+        accepted
     }
 }

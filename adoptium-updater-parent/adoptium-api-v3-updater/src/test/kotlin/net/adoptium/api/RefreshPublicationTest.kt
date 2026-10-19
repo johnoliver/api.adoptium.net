@@ -12,6 +12,7 @@ import net.adoptium.api.v3.ReleaseResult
 import net.adoptium.api.v3.TimeSource
 import net.adoptium.api.v3.V3Updater
 import net.adoptium.api.v3.dataSources.APIDataStore
+import net.adoptium.api.v3.dataSources.VersionSupplier
 import net.adoptium.api.v3.dataSources.github.graphql.models.PageInfo
 import net.adoptium.api.v3.dataSources.github.graphql.models.summary.GHAssetsSummary
 import net.adoptium.api.v3.dataSources.github.graphql.models.summary.GHReleaseSummary
@@ -24,6 +25,7 @@ import net.adoptium.api.v3.dataSources.models.Releases
 import net.adoptium.api.v3.dataSources.persitence.ApiPersistence
 import net.adoptium.api.v3.dataSources.persitence.mongo.UpdatedInfo
 import net.adoptium.api.v3.models.DateTime
+import net.adoptium.api.v3.models.GitHubDownloadStatsDbEntry
 import net.adoptium.api.v3.models.Release
 import net.adoptium.api.v3.models.ReleaseType
 import net.adoptium.api.v3.models.Vendor
@@ -32,6 +34,7 @@ import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.params.ParameterizedTest
 import org.junit.jupiter.params.provider.CsvSource
+import org.junit.jupiter.params.provider.ValueSource
 import java.time.ZonedDateTime
 import java.time.format.DateTimeFormatter
 
@@ -106,6 +109,82 @@ class RefreshPublicationTest {
         coVerify(exactly = 3) { repository.getReleaseById(GitHubId(old.id)) }
         assertEquals(null, updater.incrementalUpdate(expected))
         coVerify(exactly = 3) { repository.getReleaseById(GitHubId(old.id)) }
+    }
+
+    @ParameterizedTest
+    @CsvSource(
+        "validation,false", "validation,true", "publication,false", "publication,true",
+        "cancellation,false", "interruption,false", "success,false", "success,true"
+    )
+    fun `full build retry cleanup waits for accepted publication`(outcome: String, filtered: Boolean) = runBlocking {
+        val old = release("historical", now.minusDays(40))
+        val latest = release("latest", now.minusDays(20))
+        val before = repo(listOf(old, latest))
+        val repository = mockk<AdoptRepository>()
+        coEvery { repository.getSummary(8) } returns GHRepositorySummary(
+            GHReleasesSummary(listOf(old, latest).map(::summary), PageInfo(false, null)))
+        coEvery { repository.getReleaseById(GitHubId(latest.id)) } returns ReleaseResult(listOf(latest))
+        coEvery { repository.getReleaseById(GitHubId(old.id)) } returns ReleaseResult(error = "Retry")
+        val versions = mockk<VersionSupplier>()
+        every { versions.getAllVersions() } returns arrayOf(8)
+        val builder = AdoptReposBuilder(repository, versions)
+        assertEquals(before, builder.incrementalUpdate(setOf(old.release_name), before) { null })
+        coEvery { repository.getRelease(8, any()) } returns
+            (if (filtered) repo(listOf(latest)) else before).repos.getValue(8)
+        val database = mockk<ApiPersistence>(relaxed = true)
+        val store = mockk<APIDataStore>()
+        every { store.loadDataFromDb(forceUpdate = true, logEntries = false) } returns before
+        coEvery { database.getLatestGithubStatsForFeatureVersion(any()) } returns
+            if (outcome == "validation") GitHubDownloadStatsDbEntry(now, 1, emptyMap(), 8) else null
+        val error = when (outcome) {
+            "cancellation" -> CancellationException("Publication cancelled")
+            "interruption" -> InterruptedException("Publication interrupted")
+            else -> IllegalStateException("Publication failed")
+        }
+        if (outcome !in setOf("success", "validation")) {
+            coEvery { database.updateAllRepos(any(), any()) } throws error
+        }
+        val updater = V3Updater(builder, mockk(), store, database, mockk(relaxed = true),
+            mockk(relaxed = true), mockk(relaxed = true), mockk(relaxed = true))
+        if (outcome in setOf("cancellation", "interruption")) {
+            assertThrows(error.javaClass) { runBlocking { updater.fullUpdate(before, filtered) } }
+        } else {
+            assertEquals(if (outcome == "success") before else null, updater.fullUpdate(before, filtered))
+        }
+        coVerify(exactly = if (outcome == "validation") 0 else 1) { database.updateAllRepos(any(), any()) }
+        coEvery { repository.getReleaseById(GitHubId(old.id)) } returns ReleaseResult(listOf(old))
+        // No explicit request is drained: only builder state can trigger the old EA.
+        assertEquals(before, builder.incrementalUpdate(emptySet(), before) { null })
+        val expectedFetches = if (outcome == "success" && !filtered) 1 else 2
+        coVerify(exactly = expectedFetches) { repository.getReleaseById(GitHubId(old.id)) }
+        builder.incrementalUpdate(emptySet(), before) { null }
+        coVerify(exactly = expectedFetches) { repository.getReleaseById(GitHubId(old.id)) }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = ["replaced", "empty", "excluded"])
+    fun `no change incremental success accepts pending outcome cleanup`(outcome: String) = runBlocking {
+        val old = release("historical", now.minusDays(40))
+        val latest = release("latest", now.minusDays(20))
+        val repository = mockk<AdoptRepository>()
+        coEvery { repository.getSummary(8) } returns GHRepositorySummary(
+            GHReleasesSummary(listOf(old, latest).map(::summary), PageInfo(false, null)))
+        coEvery { repository.getReleaseById(GitHubId(latest.id)) } returns ReleaseResult(listOf(latest))
+        coEvery { repository.getReleaseById(GitHubId(old.id)) } returns ReleaseResult(error = "Retry")
+        val builder = AdoptReposBuilder(repository, mockk())
+        val before = repo(if (outcome == "replaced") listOf(old, latest) else listOf(latest))
+        assertEquals(before, builder.incrementalUpdate(setOf(old.release_name), before) { null })
+        coEvery { repository.getReleaseById(GitHubId(old.id)) } returns when (outcome) {
+            "empty" -> ReleaseResult(emptyList())
+            "excluded" -> ReleaseResult(error = "Excluded", retryable = false)
+            else -> ReleaseResult(listOf(old))
+        }
+        // The snapshot is unchanged, so publication must not be attempted.
+        val database = mockk<ApiPersistence>(relaxed = true)
+        val updater = V3Updater(builder, mockk(), mockk(), database, mockk(), mockk(), mockk(), mockk())
+        repeat(2) { assertEquals(null, updater.incrementalUpdate(before)) }
+        coVerify(exactly = 2) { repository.getReleaseById(GitHubId(old.id)) }
+        coVerify(exactly = 0) { database.updateAllRepos(any(), any()) }
     }
 
     private fun summary(release: Release) = GHReleaseSummary(GitHubId(release.id),
