@@ -6,6 +6,7 @@ import io.mockk.confirmVerified
 import io.mockk.junit5.MockKExtension
 import io.mockk.mockk
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
@@ -23,11 +24,14 @@ import org.apache.http.entity.StringEntity
 import org.apache.http.message.BasicHttpResponse
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertNull
+import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.DynamicTest
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.TestFactory
 import org.junit.jupiter.api.extension.ExtendWith
+import org.junit.jupiter.params.ParameterizedTest
+import org.junit.jupiter.params.provider.ValueSource
 import java.time.ZonedDateTime
 import java.util.stream.Stream
 
@@ -113,6 +117,87 @@ class CachedGitHubHtmlClientTest {
         assertEquals("body", CachedGitHubHtmlClient(store, http).getUrl("demand"))
         assertEquals(0L, store.evictUnusedCache(before.minusDays(30)))
         assertTrue(!store.getCachedWebpage("demand")!!.lastAccessed!!.isBefore(before))
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = ["null", "empty", "blank"])
+    fun `unusable cached bodies are fetched unconditionally even when recently checked`(format: String) = runBlocking {
+        val store = InMemoryInternalDbStore()
+        val now = TimeSource.now()
+        val modified = CachedGitHubHtmlClient.LAST_MODIFIED_PARSER.format(now.minusYears(1))
+        val oldBody = when (format) { "null" -> null; "empty" -> ""; else -> "  " }
+        store.putCachedWebpage("recover", modified, now, oldBody).join()
+        val http = mockk<UpdaterHtmlClient>()
+        coEvery { http.getFullResponse(UrlRequest("recover")) } returns
+            BasicHttpResponse(HttpVersion.HTTP_1_1, 200, "OK").apply { entity = StringEntity("recovered") }
+        val client = CachedGitHubHtmlClient(store, http)
+        assertEquals("recovered", client.getUrl("recover"))
+        assertEquals("recovered", client.getUrl("recover"))
+        coVerify(exactly = 1) { http.getFullResponse(UrlRequest("recover")) }
+        coVerify(exactly = 0) { http.getFullResponse(UrlRequest("recover", modified)) }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = ["null-response", "empty-body", "no-body", "server-error", "not-modified"])
+    fun `failed demand responses are not cached and the next access can recover`(failure: String) = runBlocking {
+        val store = InMemoryInternalDbStore()
+        val http = mockk<UpdaterHtmlClient>()
+        val client = CachedGitHubHtmlClient(store, http)
+        coEvery { http.getFullResponse(UrlRequest("retry")) } returns when (failure) {
+            "null-response" -> null
+            "empty-body" -> BasicHttpResponse(HttpVersion.HTTP_1_1, 200, "OK").apply { entity = StringEntity("") }
+            "no-body" -> BasicHttpResponse(HttpVersion.HTTP_1_1, 200, "OK")
+            "server-error" -> BasicHttpResponse(HttpVersion.HTTP_1_1, 503, "Unavailable").apply { entity = StringEntity("not metadata") }
+            else -> BasicHttpResponse(HttpVersion.HTTP_1_1, 304, "Not Modified")
+        }
+        assertNull(client.getUrl("retry"))
+        assertNull(store.getCachedWebpage("retry"))
+        coEvery { http.getFullResponse(UrlRequest("retry")) } returns
+            BasicHttpResponse(HttpVersion.HTTP_1_1, 200, "OK").apply { entity = StringEntity("now available") }
+        assertEquals("now available", client.getUrl("retry"))
+        assertEquals("now available", store.getCachedWebpage("retry")!!.data)
+        coVerify(exactly = 2) { http.getFullResponse(UrlRequest("retry")) }
+    }
+
+    @Test
+    fun `cancelled demand fetch is not cached or retried`() = runBlocking {
+        val store = InMemoryInternalDbStore()
+        val http = mockk<UpdaterHtmlClient>()
+        coEvery { http.getFullResponse(UrlRequest("cancel")) } throws CancellationException("Stopping updater")
+        val client = CachedGitHubHtmlClient(store, http)
+        assertThrows(CancellationException::class.java) { runBlocking { client.getUrl("cancel") } }
+        assertNull(store.getCachedWebpage("cancel"))
+        coVerify(exactly = 1) { http.getFullResponse(UrlRequest("cancel")) }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = ["null-response", "empty-body"])
+    fun `failed background refresh preserves the old body and validation time`(failure: String) = runBlocking {
+        val backing = InMemoryInternalDbStore()
+        val now = TimeSource.now()
+        val checked = now.minusDays(2)
+        val modified = CachedGitHubHtmlClient.LAST_MODIFIED_PARSER.format(now)
+        backing.putCachedWebpage("stale", modified, checked, "usable").join()
+        backing.putCachedWebpage("marker", modified, checked, "marker body").join()
+        val drained = CompletableDeferred<Unit>()
+        val store = object : InternalDbStore by backing {
+            override suspend fun updateCheckedTime(url: String, dateTime: ZonedDateTime) {
+                backing.updateCheckedTime(url, dateTime)
+                if (url == "marker") drained.complete(Unit)
+            }
+        }
+        val http = mockk<UpdaterHtmlClient>()
+        coEvery { http.getFullResponse(UrlRequest("stale", modified)) } returns if (failure == "null-response") null
+            else BasicHttpResponse(HttpVersion.HTTP_1_1, 200, "OK").apply { entity = StringEntity("") }
+        coEvery { http.getFullResponse(UrlRequest("marker", modified)) } returns
+            BasicHttpResponse(HttpVersion.HTTP_1_1, 304, "Not Modified")
+        val client = CachedGitHubHtmlClient(store, http)
+        assertEquals("usable", client.getUrl("stale"))
+        assertEquals("marker body", client.getUrl("marker"))
+        // The single refresh worker reaches the marker only after stale completes.
+        withTimeout(5000) { drained.await() }
+        assertEquals("usable", backing.getCachedWebpage("stale")!!.data)
+        assertEquals(checked, backing.getCachedWebpage("stale")!!.lastChecked)
     }
 
     @TestFactory
