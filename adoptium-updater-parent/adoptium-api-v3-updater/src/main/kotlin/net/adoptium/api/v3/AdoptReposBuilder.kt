@@ -29,11 +29,12 @@ class AdoptReposBuilder @Inject constructor(
     suspend fun incrementalUpdate(
         toUpdate: Set<String>,
         repo: AdoptRepos,
+        onExcluded: (GitHubId) -> Unit = {},
         gitHubMetadataSupplier: suspend (GitHubId) -> GHReleaseMetadata?,
     ): AdoptRepos {
         val updated = repo
             .repos
-            .map { entry -> getUpdatedFeatureRelease(toUpdate, entry, gitHubMetadataSupplier) }
+            .map { entry -> getUpdatedFeatureRelease(toUpdate, entry, onExcluded, gitHubMetadataSupplier) }
 
         return AdoptRepos(updated)
     }
@@ -41,6 +42,7 @@ class AdoptReposBuilder @Inject constructor(
     private suspend fun getUpdatedFeatureRelease(
         toUpdate: Set<String>,
         entry: Map.Entry<Int, FeatureRelease>,
+        onExcluded: (GitHubId) -> Unit,
         gitHubMetadataSupplier: suspend (GitHubId) -> GHReleaseMetadata?,
     ): FeatureRelease {
         val summaries = adoptRepository.getSummary(entry.key).releases.releases.distinctBy { it.id }
@@ -70,6 +72,7 @@ class AdoptReposBuilder @Inject constructor(
                 LOGGER.warn("Failed to refresh ${summary.id.id}", e)
                 ReleaseResult(error = "Release fetch failed")
             }
+            if (!result.succeeded() && !result.retryable) onExcluded(summary.id)
             summary.id to result
         }
         // Only complete snapshots (including empty ones) and explicit permanent

@@ -34,7 +34,9 @@ import net.adoptium.api.v3.dataSources.models.Releases
 import net.adoptium.api.v3.mapping.adopt.AdoptBinaryMapper
 import net.adoptium.api.v3.mapping.adopt.AdoptReleaseMapperFactory
 import net.adoptium.api.v3.models.Release
+import net.adoptium.api.v3.models.GitHubDownloadStatsDbEntry
 import net.adoptium.api.v3.models.Vendor
+import net.adoptium.api.v3.stats.GitHubDownloadStatsCalculator
 import org.junit.jupiter.api.Assertions.*
 import org.junit.jupiter.api.Assumptions.assumeTrue
 import org.junit.jupiter.api.Test
@@ -42,7 +44,11 @@ import org.junit.jupiter.params.ParameterizedTest
 import org.junit.jupiter.params.provider.CsvSource
 import org.junit.jupiter.params.provider.ValueSource
 import java.time.format.DateTimeFormatter
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 class EaFailureRetentionTest {
     private val time = DateTimeFormatter.ISO_INSTANT.format(TimeSource.now().minusDays(2))
@@ -294,7 +300,7 @@ class EaFailureRetentionTest {
         val versions = versions()
         val builder = spyk(AdoptReposBuilder(AdoptRepositoryImpl(api, factory), versions))
         // Do not let the incremental pass hide a broken full-publication merge.
-        coEvery { builder.incrementalUpdate(any(), any(), any()) } answers { secondArg<AdoptRepos>() }
+        coEvery { builder.incrementalUpdate(any(), any(), any(), any()) } answers { secondArg<AdoptRepos>() }
         val database = spyk(InMemoryApiPersistence(before, mockk()))
         val updater = V3Updater(builder, mockk(), APIDataStoreImpl(database), database, mockk(relaxed = true),
             ReleaseVersionResolver(versions), mockk(relaxed = true), versions)
@@ -325,6 +331,76 @@ class EaFailureRetentionTest {
         }
     }
 
+    @ParameterizedTest
+    @CsvSource(
+        "static,full,false", "static,full,true", "dynamic,full,false", "dynamic,full,true",
+        "static,incremental,false", "static,incremental,true", "dynamic,incremental,false", "dynamic,incremental,true",
+        "static,empty,false", "dynamic,empty,false"
+    )
+    fun `intentional exclusions adjust saved statistics without permitting unrelated losses`(policy: String, phase: String, loss: Boolean): Unit = runBlocking {
+        healthyMetadata()
+        val original = release().copy(name = if (policy == "static") "jdk-11.0.13'+8" else "jdk8u-2026-10-01-12-00-beta")
+        val excludedSplits = mapper.toAdoptRelease(original).result!!
+        assertEquals(2, excludedSplits.size)
+        val healthyOriginal = release("ea-other", false).let {
+            it.copy(releaseAssets = it.releaseAssets.copy(assets = it.releaseAssets.assets.take(2)))
+        }
+        val healthySplits = if (phase == "empty") emptyList() else mapper.toAdoptRelease(healthyOriginal).result!!
+        val before = repos(excludedSplits + healthySplits)
+        val damaged = original.copy(releaseAssets = original.releaseAssets.copy(
+            assets = original.releaseAssets.assets.filterNot { it.name.endsWith(".json") }
+        ))
+        val healthy = healthyOriginal.copy(releaseAssets = healthyOriginal.releaseAssets.copy(
+            assets = healthyOriginal.releaseAssets.assets.map { it.copy(downloadCount = if (loss) 9 else 11) }
+        ))
+        val expected = if (phase == "empty") emptyList() else mapper.toAdoptRelease(healthy).result!!
+        val api = github { listOf(damaged) + if (phase == "empty") emptyList() else listOf(healthy) }
+        val versions = versions()
+        val realBuilder = AdoptReposBuilder(AdoptRepositoryImpl(api, factory), versions)
+        val builder = spyk(realBuilder)
+        var blockFull = phase == "incremental"
+        coEvery { builder.build(any(), any(), any()) } coAnswers {
+            if (blockFull) error("Full rebuild unavailable during incremental regression")
+            else realBuilder.build(firstArg(), secondArg(), thirdArg())
+        }
+        if (phase != "incremental") {
+            // Neither incremental pruning nor a later pass may conceal a rejected full publication.
+            coEvery { builder.incrementalUpdate(any(), any(), any(), any()) } answers { secondArg<AdoptRepos>() }
+        }
+        val database = InMemoryApiPersistence(before, mockk())
+        database.updateAllRepos(before, V3Updater.calculateChecksum(before))
+        val initialStats = GitHubDownloadStatsCalculator.getStats(before).single()
+        database.addGithubDownloadStatsEntries(listOf(GitHubDownloadStatsDbEntry(
+            TimeSource.now().minusDays(1), initialStats.downloads, initialStats.jvmImplDownloads, 8
+        )))
+        assertTrue(initialStats.downloads > 0)
+        fun updater() = V3Updater(builder, mockk(), APIDataStoreImpl(database), database, mockk(relaxed = true),
+            ReleaseVersionResolver(versions), mockk(relaxed = true), versions)
+        val updateLegacy = APIConfig.UPDATE_ADOPTOPENJDK
+        try {
+            APIConfig.UPDATE_ADOPTOPENJDK = true
+            val published = updater().runUpdate(before, AtomicBoolean(true), mockk())
+            if (loss) {
+                assertEquals(nodes(before), nodes(published))
+                assertEquals(nodes(before), nodes(database.repos))
+                assertEquals(initialStats.downloads, database.getLatestGithubStatsForFeatureVersion(8)!!.downloads)
+                assertEquals(1, database.getStatsForFeatureVersion(8).size)
+            } else {
+                assertEquals(expected.associateBy { it.id }, published.allReleases.nodes)
+                assertEquals(published.allReleases.nodes, database.repos.allReleases.nodes)
+                assertEquals(expected.sumOf { it.download_count }, database.getLatestGithubStatsForFeatureVersion(8)!!.downloads)
+                assertEquals(initialStats.downloads, database.getStatsForFeatureVersion(8).first().downloads)
+                // A fresh updater must use the durable adjusted baseline, not process-local credits.
+                blockFull = false
+                val again = updater().runUpdate(published, AtomicBoolean(true), mockk())
+                assertEquals(published.allReleases.nodes, again.allReleases.nodes)
+                assertEquals(again.allReleases.nodes, database.repos.allReleases.nodes)
+            }
+        } finally {
+            APIConfig.UPDATE_ADOPTOPENJDK = updateLegacy
+        }
+    }
+
     @Test
     fun `full publication removes known exclusions even outside the EA age window`() = runBlocking {
         healthyMetadata()
@@ -334,5 +410,211 @@ class EaFailureRetentionTest {
         val filter = ReleaseIncludeFilter(TimeSource.now(), ReleaseFilterType.RELEASES_ONLY)
         val retained = V3Updater.copyOldReleasesIntoNewRepo(old, repos(emptyList()), filter)
         assertTrue(retained.allReleases.nodeList.isEmpty())
+    }
+
+    @ParameterizedTest
+    @CsvSource("full,stats", "full,releases", "incremental,stats", "incremental,releases")
+    fun `failed exclusion publication is retryable after restart without allowing unrelated losses`(phase: String, failure: String): Unit = runBlocking {
+        healthyMetadata()
+        val original = release().copy(name = "jdk8u-2026-10-01-12-00-beta")
+        val healthy = release("healthy", false).let {
+            it.copy(releaseAssets = it.releaseAssets.copy(assets = it.releaseAssets.assets.take(2)))
+        }
+        fun withDownloads(count: Int) = healthy.copy(releaseAssets = healthy.releaseAssets.copy(
+            assets = healthy.releaseAssets.assets.map { it.copy(downloadCount = count.toLong()) }
+        ))
+        val before = repos(mapper.toAdoptRelease(original).result!! + mapper.toAdoptRelease(healthy).result!!)
+        val damaged = original.copy(releaseAssets = original.releaseAssets.copy(
+            assets = original.releaseAssets.assets.filterNot { it.name.endsWith(".json") }
+        ))
+        var current = damaged
+        var currentHealthy = withDownloads(11)
+        val versions = versions()
+        val realBuilder = AdoptReposBuilder(AdoptRepositoryImpl(github { listOf(current, currentHealthy) }, factory), versions)
+        val builder = spyk(realBuilder)
+        var blockFull = phase == "incremental"
+        coEvery { builder.build(any(), any(), any()) } coAnswers {
+            if (blockFull) error("Full rebuild unavailable") else realBuilder.build(firstArg(), secondArg(), thirdArg())
+        }
+        if (phase == "full") {
+            coEvery { builder.incrementalUpdate(any(), any(), any(), any()) } answers { secondArg<AdoptRepos>() }
+        }
+        val database = object : InMemoryApiPersistence(before, mockk()) {
+            var failStats = false
+            var failReleases = false
+            override suspend fun addGithubDownloadStatsEntries(stats: List<GitHubDownloadStatsDbEntry>) {
+                check(!failStats) { "Injected statistics failure" }
+                super.addGithubDownloadStatsEntries(stats)
+            }
+            override suspend fun updateAllRepos(repos: AdoptRepos, checksum: String) {
+                check(!failReleases) { "Injected release failure" }
+                super.updateAllRepos(repos, checksum)
+            }
+        }
+        val initial = GitHubDownloadStatsCalculator.getStats(before).single()
+        database.addGithubDownloadStatsEntries(listOf(GitHubDownloadStatsDbEntry(TimeSource.now().minusDays(1), initial.downloads, null, 8)))
+        fun updater() = V3Updater(builder, mockk(), APIDataStoreImpl(database), database, mockk(relaxed = true),
+            ReleaseVersionResolver(versions), mockk(relaxed = true), versions)
+        val updateLegacy = APIConfig.UPDATE_ADOPTOPENJDK
+        try {
+            APIConfig.UPDATE_ADOPTOPENJDK = true
+            database.failStats = failure == "stats"
+            database.failReleases = failure == "releases"
+            updater().runUpdate(before, AtomicBoolean(true), mockk())
+            assertEquals(nodes(before), nodes(database.repos))
+            assertEquals(V3Updater.calculateChecksum(before), database.getUpdatedAt().checksum)
+            assertEquals(if (failure == "stats") initial.downloads else 11L, database.getLatestGithubStatsForFeatureVersion(8)!!.downloads)
+
+            database.failStats = false
+            database.failReleases = false
+            blockFull = false
+            current = original // No exclusions: the early adjustment must not waive a healthy loss.
+            currentHealthy = withDownloads(9)
+            val rejected = updater().runUpdate(database.repos, AtomicBoolean(true), mockk())
+            assertEquals(nodes(before), nodes(rejected))
+            assertEquals(nodes(before), nodes(database.repos))
+
+            current = damaged
+            currentHealthy = withDownloads(11)
+            val recovered = updater().runUpdate(database.repos, AtomicBoolean(true), mockk())
+            assertEquals(mapper.toAdoptRelease(currentHealthy).result!!.associateBy { it.id }, nodes(recovered))
+            assertEquals(nodes(recovered), nodes(database.repos))
+            assertEquals(11L, database.getLatestGithubStatsForFeatureVersion(8)!!.downloads)
+            assertEquals(nodes(recovered), nodes(updater().runUpdate(recovered, AtomicBoolean(true), mockk())))
+        } finally {
+            APIConfig.UPDATE_ADOPTOPENJDK = updateLegacy
+        }
+    }
+
+    @Test
+    fun `full rebuild waits for failed publication before capturing generation and can recover`(): Unit = runBlocking {
+        healthyMetadata()
+        val original = release().copy(name = "jdk8u-2026-10-01-12-00-beta")
+        val healthy = release("healthy", false).let {
+            it.copy(releaseAssets = it.releaseAssets.copy(assets = it.releaseAssets.assets.take(2)))
+        }
+        suspend fun healthyRepo(count: Long) = repos(mapper.toAdoptRelease(healthy.copy(
+            releaseAssets = healthy.releaseAssets.copy(assets = healthy.releaseAssets.assets.map { it.copy(downloadCount = count) })
+        )).result!!)
+        val before = repos(mapper.toAdoptRelease(original).result!! + mapper.toAdoptRelease(healthy).result!!)
+        val partial = healthyRepo(15)
+        val unsafe = healthyRepo(11)
+        val recovered = healthyRepo(16)
+        val writing = CountDownLatch(1)
+        val finishWriting = CountDownLatch(1)
+        val readerStarted = CountDownLatch(1)
+        val generationRead = CountDownLatch(1)
+        val observeReads = AtomicBoolean(false)
+        val database = object : InMemoryApiPersistence(before, mockk()) {
+            var failOnce = true
+            override suspend fun getUpdatedAt() = super.getUpdatedAt().also {
+                if (observeReads.get()) generationRead.countDown()
+            }
+            override suspend fun updateAllRepos(repos: AdoptRepos, checksum: String) {
+                if (failOnce) {
+                    failOnce = false
+                    super.updateAllRepos(before, "incomplete:concurrent-failure")
+                    writing.countDown()
+                    check(finishWriting.await(10, TimeUnit.SECONDS)) { "Timed out releasing publication" }
+                    // The write fails after changing data but without changing its incomplete marker.
+                    super.updateAllRepos(partial, "incomplete:concurrent-failure")
+                    error("Injected partial release write failure")
+                }
+                super.updateAllRepos(repos, checksum)
+            }
+        }
+        database.addGithubDownloadStatsEntries(listOf(GitHubDownloadStatsDbEntry(TimeSource.now().minusDays(1), 30, null, 8)))
+        val versions = versions()
+        val builder = mockk<AdoptReposBuilder>()
+        val builds = AtomicInteger()
+        coEvery { builder.build(any(), any(), any()) } answers {
+            thirdArg<(GitHubId) -> Unit>()(original.id)
+            if (builds.getAndIncrement() == 0) partial else unsafe
+        }
+        val updater = V3Updater(builder, mockk(), APIDataStoreImpl(database), database, mockk(relaxed = true),
+            ReleaseVersionResolver(versions), mockk(relaxed = true), versions)
+        // Isolate one full pass so subsequent incremental/full passes cannot conceal stale publication.
+        val fullUpdate = V3Updater::class.java.getDeclaredMethod("fullUpdate", AdoptRepos::class.java, Boolean::class.javaPrimitiveType)
+            .also { it.isAccessible = true }
+        val executor = Executors.newFixedThreadPool(2)
+        try {
+            val writer = executor.submit<AdoptRepos?> { fullUpdate.invoke(updater, before, false) as AdoptRepos? }
+            assertTrue(writing.await(10, TimeUnit.SECONDS))
+            observeReads.set(true)
+            val reader = executor.submit<AdoptRepos?> {
+                readerStarted.countDown()
+                fullUpdate.invoke(updater, before, false) as AdoptRepos?
+            }
+            assertTrue(readerStarted.await(10, TimeUnit.SECONDS))
+            val readDuringPublication = generationRead.await(1, TimeUnit.SECONDS)
+            finishWriting.countDown()
+            assertNull(writer.get(10, TimeUnit.SECONDS))
+            val latest = reader.get(10, TimeUnit.SECONDS)!!
+            assertFalse(readDuringPublication, "Do not capture an in-flight incomplete generation")
+            assertEquals(nodes(partial), nodes(latest))
+            assertEquals(nodes(partial), nodes(database.repos))
+            assertEquals(1, builds.get(), "A stale input must reload before rebuilding or spending exclusions")
+            assertEquals("incomplete:concurrent-failure", database.getUpdatedAt().checksum)
+            assertEquals(15L, database.getLatestGithubStatsForFeatureVersion(8)!!.downloads)
+
+            // A stable incomplete generation is recoverable, not a permanent publication veto.
+            coEvery { builder.build(any(), any(), any()) } returns recovered
+            assertEquals(nodes(recovered), nodes(fullUpdate.invoke(updater, latest, false) as AdoptRepos))
+            assertEquals(nodes(recovered), nodes(database.repos))
+            assertEquals(V3Updater.calculateChecksum(recovered), database.getUpdatedAt().checksum)
+        } finally {
+            finishWriting.countDown()
+            executor.shutdownNow()
+            assertTrue(executor.awaitTermination(10, TimeUnit.SECONDS))
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = ["before-build", "during-build"])
+    fun `stale full rebuild cannot reuse an already published exclusion credit`(timing: String): Unit = runBlocking {
+        healthyMetadata()
+        val original = release().copy(name = "jdk8u-2026-10-01-12-00-beta")
+        val healthy = release("healthy", false).let {
+            it.copy(releaseAssets = it.releaseAssets.copy(assets = it.releaseAssets.assets.take(2)))
+        }
+        fun withDownloads(count: Int) = healthy.copy(releaseAssets = healthy.releaseAssets.copy(
+            assets = healthy.releaseAssets.assets.map { it.copy(downloadCount = count.toLong()) }
+        ))
+        val before = repos(mapper.toAdoptRelease(original).result!! + mapper.toAdoptRelease(healthy).result!!)
+        val newer = repos(mapper.toAdoptRelease(withDownloads(15)).result!!)
+        val damaged = original.copy(releaseAssets = original.releaseAssets.copy(
+            assets = original.releaseAssets.assets.filterNot { it.name.endsWith(".json") }
+        ))
+        val database = InMemoryApiPersistence(before, mockk())
+        database.addGithubDownloadStatsEntries(listOf(GitHubDownloadStatsDbEntry(TimeSource.now().minusDays(1), 30, null, 8)))
+        suspend fun publishNewer() {
+            database.updateAllRepos(newer, V3Updater.calculateChecksum(newer))
+            database.addGithubDownloadStatsEntries(listOf(GitHubDownloadStatsDbEntry(TimeSource.now(), 15, null, 8)))
+        }
+        val versions = versions()
+        val realBuilder = AdoptReposBuilder(AdoptRepositoryImpl(github { listOf(damaged, withDownloads(11)) }, factory), versions)
+        val builder = spyk(realBuilder)
+        var interleave = timing == "during-build"
+        coEvery { builder.build(any(), any(), any()) } coAnswers {
+            val candidate = realBuilder.build(firstArg(), secondArg(), thirdArg())
+            if (interleave) { interleave = false; publishNewer() }
+            candidate
+        }
+        coEvery { builder.incrementalUpdate(any(), any(), any(), any()) } answers { secondArg<AdoptRepos>() }
+        val updater = V3Updater(builder, mockk(), APIDataStoreImpl(database), database, mockk(relaxed = true),
+            ReleaseVersionResolver(versions), mockk(relaxed = true), versions)
+        val updateLegacy = APIConfig.UPDATE_ADOPTOPENJDK
+        try {
+            APIConfig.UPDATE_ADOPTOPENJDK = true
+            if (timing == "before-build") publishNewer()
+            val published = updater.runUpdate(before, AtomicBoolean(true), mockk())
+            assertEquals(nodes(newer), nodes(published))
+            assertEquals(nodes(newer), nodes(database.repos))
+            assertEquals(V3Updater.calculateChecksum(newer), database.getUpdatedAt().checksum)
+            assertEquals(15L, database.getLatestGithubStatsForFeatureVersion(8)!!.downloads)
+            assertEquals(2, database.getStatsForFeatureVersion(8).size)
+        } finally {
+            APIConfig.UPDATE_ADOPTOPENJDK = updateLegacy
+        }
     }
 }

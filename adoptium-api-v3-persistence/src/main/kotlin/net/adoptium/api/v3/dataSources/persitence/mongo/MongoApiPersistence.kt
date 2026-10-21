@@ -34,6 +34,7 @@ import org.bson.Document
 import org.slf4j.LoggerFactory
 import java.time.Instant
 import java.time.ZonedDateTime
+import java.util.UUID
 
 @ApplicationScoped
 open class MongoApiPersistence @Inject constructor(mongoClient: MongoClient) : MongoInterface(), ApiPersistence {
@@ -79,16 +80,15 @@ open class MongoApiPersistence @Inject constructor(mongoClient: MongoClient) : M
     }
 
     override suspend fun updateAllRepos(repos: AdoptRepos, checksum: String) {
-
-        try {
-            repos
-                .repos
-                .forEach { repo ->
-                    writeReleases(repo.key, repo.value)
-                }
-        } finally {
-            updateUpdatedTime(TimeSource.now(), checksum, repos.hashCode())
+        // Deletes/inserts are not atomic. Invalidate before mutating so a partial
+        // failure cannot reuse the previous generation or advertise the target.
+        // A fresh token also invalidates rebuilds started after an earlier failure.
+        updateUpdatedTime(TimeSource.now(), "incomplete:${UUID.randomUUID()}", 0)
+        repos.repos.forEach { (version, releases) ->
+            writeReleases(version, releases)
         }
+        releasesCollection.deleteMany(Document("version_data.major", Document("\$nin", repos.repos.keys.toList())))
+        updateUpdatedTime(TimeSource.now(), checksum, repos.hashCode())
     }
 
     override suspend fun updateCdxaRepos(repo: AdoptCdxaRepos, checksum: String) {
@@ -108,8 +108,8 @@ open class MongoApiPersistence @Inject constructor(mongoClient: MongoClient) : M
 
     private suspend fun writeReleases(featureVersion: Int, value: FeatureRelease) {
         val toAdd = value.releases.getReleases().toList()
+        releasesCollection.deleteMany(majorVersionMatcher(featureVersion))
         if (toAdd.isNotEmpty()) {
-            releasesCollection.deleteMany(majorVersionMatcher(featureVersion))
             releasesCollection.insertMany(toAdd, InsertManyOptions())
         }
     }
