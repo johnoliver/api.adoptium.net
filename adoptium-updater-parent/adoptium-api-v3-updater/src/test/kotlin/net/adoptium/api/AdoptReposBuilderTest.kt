@@ -9,10 +9,12 @@ import net.adoptium.api.testDoubles.UpdatableVersionSupplierStub
 import net.adoptium.api.v3.AdoptReposBuilder
 import net.adoptium.api.v3.AdoptRepository
 import net.adoptium.api.v3.ReleaseResult
+import net.adoptium.api.v3.TimeSource
 import net.adoptium.api.v3.dataSources.VersionSupplier
 import net.adoptium.api.v3.dataSources.models.AdoptRepos
 import net.adoptium.api.v3.dataSources.models.GitHubId
 import net.adoptium.api.v3.models.GHReleaseMetadata
+import net.adoptium.api.v3.models.ReleaseType
 import org.jboss.weld.junit5.auto.EnableAutoWeld
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
@@ -36,10 +38,13 @@ class AdoptReposBuilderTest : BaseTest() {
             val adoptRepo = spyk(adoptRepository)
             val adoptReposBuilder = AdoptReposBuilder(adoptRepo, UpdatableVersionSupplierStub())
 
-            // Choose an old, unchanged release rather than relying on map order
-            // after snapshot replacement has removed and reinserted releases.
+            // An unchanged EA may still be polled as the latest EA. Choose an
+            // old GA so only an explicit request can trigger its refresh.
             val toUpdate = before.getFeatureRelease(8)!!.releases.nodes.values.first {
-                it.id != adoptRepository.toRemove.id && it.id != adoptRepository.originalToUpdate.id
+                it.id != adoptRepository.toRemove.id && it.id != adoptRepository.originalToUpdate.id &&
+                    it.release_type == ReleaseType.ga &&
+                    it.timestamp.dateTime.isBefore(TimeSource.now().minusDays(7)) &&
+                    it.updated_at.dateTime.isBefore(TimeSource.now().minusDays(7))
             }
             val id = GitHubId(toUpdate.id)
 
