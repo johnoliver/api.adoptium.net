@@ -13,6 +13,7 @@ import net.adoptium.api.v3.dataSources.github.graphql.models.GHAsset
 import net.adoptium.api.v3.dataSources.github.graphql.models.summary.GHRepositorySummary
 import net.adoptium.api.v3.dataSources.models.FeatureRelease
 import net.adoptium.api.v3.dataSources.models.GitHubId
+import net.adoptium.api.v3.models.Release
 import net.adoptium.api.v3.releaseNotes.AdoptReleaseNotes
 import org.jboss.weld.junit5.auto.AddPackages
 import org.junit.jupiter.api.Assertions
@@ -65,8 +66,10 @@ class AdoptReleaseNotesTest : BaseTest() {
     }
 
     private fun addReleaseNotesFiles(adoptRepository: AdoptRepository) = object : AdoptRepository {
-        override suspend fun getRelease(version: Int, filter: ReleaseIncludeFilter): FeatureRelease? {
-            return adoptRepository.getRelease(version, filter)
+        override suspend fun getRelease(
+            version: Int, filter: ReleaseIncludeFilter, previous: List<Release>, onExcluded: (GitHubId) -> Unit
+        ): FeatureRelease? {
+            return adoptRepository.getRelease(version, filter, previous, onExcluded)
         }
 
         override suspend fun getSummary(version: Int): GHRepositorySummary {

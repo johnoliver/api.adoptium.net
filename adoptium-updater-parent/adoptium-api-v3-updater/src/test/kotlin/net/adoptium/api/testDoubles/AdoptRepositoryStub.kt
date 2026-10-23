@@ -81,7 +81,9 @@ open class AdoptRepositoryStub : AdoptRepository {
         )
     }
 
-    override suspend fun getRelease(version: Int, filter: ReleaseIncludeFilter): FeatureRelease? {
+    override suspend fun getRelease(
+        version: Int, filter: ReleaseIncludeFilter, previous: List<Release>, onExcluded: (GitHubId) -> Unit
+    ): FeatureRelease? {
         return updated.getFeatureRelease(version)
     }
 

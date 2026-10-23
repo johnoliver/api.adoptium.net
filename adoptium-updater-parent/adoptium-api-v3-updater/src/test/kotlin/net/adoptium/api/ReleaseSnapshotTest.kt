@@ -54,8 +54,10 @@ import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.api.Assumptions.assumeTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.params.ParameterizedTest
+import org.junit.jupiter.params.provider.CsvSource
 import org.junit.jupiter.params.provider.ValueSource
 import tools.jackson.databind.json.JsonMapper
 import java.time.format.DateTimeFormatter
@@ -108,14 +110,25 @@ class ReleaseSnapshotTest {
             ReleaseVersionResolver(versions), mockk(relaxed = true), versions)
 
     @ParameterizedTest
-    @ValueSource(strings = ["null-response", "missing-data", "missing-node", "decode"])
-    fun `failed second asset page preserves every split and aborts full publication`(failure: String) = runBlocking {
-        val complete = upstream()
+    @CsvSource("null-response,false,false", "missing-data,false,false", "missing-node,false,false", "decode,false,false",
+        "null-response,true,false", "missing-data,true,false", "missing-node,true,false", "decode,true,false",
+        "null-response,false,true", "missing-data,false,true", "missing-node,false,true", "decode,false,true",
+        "null-response,true,true", "missing-data,true,true", "missing-node,true,true", "decode,true,true")
+    fun `failed second asset page preserves every split but only GA aborts full publication`(failure: String, ea: Boolean, upstreamRepo: Boolean) = runBlocking {
+        assumeTrue(!upstreamRepo || Vendor.validVendor(Vendor.openjdk))
+        val repoName = if (upstreamRepo) "openjdk8-upstream-binaries" else "temurin8-binaries"
+        val owner = if (upstreamRepo) "AdoptOpenJDK" else "adoptium"
+        val original = upstream().copy(isPrerelease = ea)
         val factory = factory(client())
-        val previous = repos(factory.get(Vendor.eclipse).toAdoptRelease(complete).result!!)
-        val prefix = upstream(listOf(first, "$first.json"))
+        val previous = repos(factory.get(Vendor.eclipse).toAdoptRelease(original).result!!)
+        val complete = if (upstreamRepo) original.copy(
+            name = if (ea) "OpenJDK 8 Early Access Release" else "OpenJDK 8 GA Release",
+            isPrerelease = !ea,
+            url = "https://github.com/$owner/$repoName/releases/tag/test"
+        ) else original
+        val prefix = complete.copy(releaseAssets = complete.releaseAssets.copy(assets = complete.releaseAssets.assets.take(2)))
         // A complete pair on the retained page maps successfully, but is not a complete snapshot.
-        assertTrue(factory.get(Vendor.eclipse).toAdoptRelease(prefix).succeeded())
+        assertTrue(factory.get(Vendor.eclipse).toAdoptRelease(original.copy(releaseAssets = prefix.releaseAssets)).succeeded())
         val paged = prefix.copy(releaseAssets = prefix.releaseAssets.copy(pageInfo = PageInfo(true, "page-two")))
         val request = object : GraphQLRequest {
             override suspend fun <T : Any> request(query: GraphQLClientRequest<T>): GraphQLClientResponse<T> {
@@ -149,27 +162,31 @@ class ReleaseSnapshotTest {
         coEvery { github.getReleaseById(complete.id) } coAnswers { releaseClient.getReleaseById(complete.id) }
         coEvery { github.getRepositorySummary(any(), any()) } answers {
             GHSummaryTestDataGenerator.generateGHRepositorySummary(GHRepository(GHReleases(
-                if (secondArg<String>() == "temurin8-binaries") listOf(complete) else emptyList(), PageInfo(false, null))))
+                if (secondArg<String>() == repoName) listOf(complete) else emptyList(), PageInfo(false, null))))
         }
         coEvery { github.getRepository(any(), any(), any()) } coAnswers {
-            if (secondArg<String>() == "temurin8-binaries") repoClient.getRepository("adoptium", "temurin8-binaries") { _, _ -> true }
+            if (secondArg<String>() == repoName) repoClient.getRepository(owner, repoName) { _, _ -> true }
             else GHRepository(GHReleases(emptyList(), PageInfo(false, null)))
         }
         val versions = versions()
         val builder = AdoptReposBuilder(AdoptRepositoryImpl(github, factory), versions)
         assertEquals(nodes(previous), nodes(builder.incrementalUpdate(setOf(complete.name), previous) { null }))
-        val error = assertThrows(Exception::class.java) { runBlocking { builder.build(ReleaseIncludeFilter.INCLUDE_ALL) } }
-        assertTrue(error.message!!.contains(when (failure) {
-            "null-response" -> "GraphQL page unavailable"
-            "missing-data" -> "No data returned"
-            "missing-node" -> "Release asset page unavailable"
-            else -> "Unable to decode GraphQL page"
-        }))
+        if (ea) {
+            assertEquals(nodes(previous), nodes(builder.build(ReleaseIncludeFilter.INCLUDE_ALL, previous)))
+        } else {
+            val error = assertThrows(Exception::class.java) { runBlocking { builder.build(ReleaseIncludeFilter.INCLUDE_ALL, previous) } }
+            assertTrue(error.message!!.contains(when (failure) {
+                "null-response" -> "GraphQL page unavailable"
+                "missing-data" -> "No data returned"
+                "missing-node" -> "Release asset page unavailable"
+                else -> "Unable to decode GraphQL page"
+            }))
+        }
         val database = spyk(InMemoryApiPersistence(previous, mockk()))
         assertNull(database.getLatestGithubStatsForFeatureVersion(8))
         updater(builder, database, versions).runUpdate(previous, AtomicBoolean(true), mockk())
         assertEquals(nodes(previous), nodes(database.repos))
-        coVerify(exactly = 0) { database.updateAllRepos(any(), any()) }
+        if (!ea) coVerify(exactly = 0) { database.updateAllRepos(any(), any()) }
     }
 
     @ParameterizedTest
