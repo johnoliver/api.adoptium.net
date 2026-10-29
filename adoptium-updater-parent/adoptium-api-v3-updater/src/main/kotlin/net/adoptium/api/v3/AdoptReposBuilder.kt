@@ -29,11 +29,12 @@ class AdoptReposBuilder @Inject constructor(
     suspend fun incrementalUpdate(
         toUpdate: Set<String>,
         repo: AdoptRepos,
+        onExcluded: (GitHubId) -> Unit = {},
         gitHubMetadataSupplier: suspend (GitHubId) -> GHReleaseMetadata?,
     ): AdoptRepos {
         val updated = repo
             .repos
-            .map { entry -> getUpdatedFeatureRelease(toUpdate, entry, gitHubMetadataSupplier) }
+            .map { entry -> getUpdatedFeatureRelease(toUpdate, entry, onExcluded, gitHubMetadataSupplier) }
 
         return AdoptRepos(updated)
     }
@@ -41,11 +42,14 @@ class AdoptReposBuilder @Inject constructor(
     private suspend fun getUpdatedFeatureRelease(
         toUpdate: Set<String>,
         entry: Map.Entry<Int, FeatureRelease>,
+        onExcluded: (GitHubId) -> Unit,
         gitHubMetadataSupplier: suspend (GitHubId) -> GHReleaseMetadata?,
     ): FeatureRelease {
         val summaries = adoptRepository.getSummary(entry.key).releases.releases.distinctBy { it.id }
         val ids = summaries.map { it.id }.toSet()
-        val pruned = entry.value.releases.nodes.filterValues { GitHubId(it.id) in ids }
+        val pruned = entry.value.releases.nodes.filterValues {
+            GitHubId(it.id) in ids && !ReleaseExclusions.isExcluded(it.release_link, it.release_name)
+        }
         val current = pruned.values.groupBy { GitHubId(it.id) }
 
         // Select upstream IDs before fetching: overlapping selectors must not fetch
@@ -68,6 +72,7 @@ class AdoptReposBuilder @Inject constructor(
                 LOGGER.warn("Failed to refresh ${summary.id.id}", e)
                 ReleaseResult(error = "Release fetch failed")
             }
+            if (!result.succeeded() && !result.retryable) onExcluded(summary.id)
             summary.id to result
         }
         // Only complete snapshots (including empty ones) and explicit permanent
@@ -86,13 +91,17 @@ class AdoptReposBuilder @Inject constructor(
         return ChronoUnit.MINUTES.between(created, TimeSource.now()).absoluteValue > 10
     }
 
-    suspend fun build(filter: ReleaseIncludeFilter): AdoptRepos {
+    suspend fun build(
+        filter: ReleaseIncludeFilter, previous: AdoptRepos = AdoptRepos(emptyList()),
+        onExcluded: (GitHubId) -> Unit = {}
+    ): AdoptRepos {
         // Fetch repos in parallel
         val reposMap = versionSupplier
             .getAllVersions()
             .reversed()
             .map { version ->
-                checkNotNull(adoptRepository.getRelease(version, filter)) { "Incomplete feature release $version" }
+                val oldReleases = previous.getFeatureRelease(version)?.releases?.nodeList.orEmpty().toList()
+                checkNotNull(adoptRepository.getRelease(version, filter, oldReleases, onExcluded)) { "Incomplete feature release $version" }
             }
             .associateBy { it.featureVersion }
         LOGGER.info("DONE")

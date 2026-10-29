@@ -18,7 +18,11 @@ import net.adoptium.api.v3.dataSources.UpdatableVersionSupplier
 import net.adoptium.api.v3.dataSources.UpdaterJsonMapper
 import net.adoptium.api.v3.dataSources.models.AdoptRepos
 import net.adoptium.api.v3.dataSources.models.AdoptCdxaRepos
+import net.adoptium.api.v3.dataSources.models.GitHubId
+import net.adoptium.api.v3.dataSources.models.FeatureRelease
+import net.adoptium.api.v3.dataSources.models.Releases
 import net.adoptium.api.v3.dataSources.persitence.ApiPersistence
+import net.adoptium.api.v3.models.GitHubDownloadStatsDbEntry
 import net.adoptium.api.v3.models.Release
 import net.adoptium.api.v3.releaseNotes.AdoptReleaseNotes
 import net.adoptium.api.v3.stats.GitHubDownloadStatsCalculator
@@ -27,6 +31,7 @@ import org.slf4j.LoggerFactory
 import java.io.OutputStream
 import java.security.MessageDigest
 import java.util.*
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentSkipListSet
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
@@ -87,13 +92,16 @@ class V3Updater @Inject constructor(
             return String(Base64.getEncoder().encode(md.digest()))
         }
 
-        fun copyOldReleasesIntoNewRepo(currentRepo: AdoptRepos, newRepoData: AdoptRepos, filter: ReleaseIncludeFilter) = currentRepo
+        fun copyOldReleasesIntoNewRepo(
+            currentRepo: AdoptRepos, newRepoData: AdoptRepos, filter: ReleaseIncludeFilter,
+            excludedIds: Set<GitHubId> = emptySet()
+        ) = ReleaseExclusions.removeExcluded(currentRepo
             .removeReleases { vendor, startTime, isPrerelease -> filter.filter(vendor, startTime, isPrerelease) }
             .addAll(newRepoData
                 .allReleases
                 .getReleases()
                 .toList()
-            )
+            ), excludedIds)
     }
 
     override fun addToUpdate(toUpdate: String): List<Release> {
@@ -121,14 +129,16 @@ class V3Updater @Inject constructor(
                 val toUpdateTmp = HashSet<String>()
                 toUpdateTmp.addAll(toUpdate)
                 toUpdate.clear()
+                val excludedIds = mutableSetOf<GitHubId>()
                 val updatedRepo = adoptReposBuilder.incrementalUpdate(
                     toUpdateTmp,
                     oldRepo,
+                    { excludedIds.add(it) },
                     database::getGhReleaseMetadata
                 )
 
                 if (updatedRepo != oldRepo) {
-                    val after = writeIncrementalUpdate(updatedRepo, oldRepo)
+                    val after = writeIncrementalUpdate(updatedRepo, oldRepo, excludedIds)
                     printRepoDebugInfo(oldRepo, after, null)
                     return@runBlocking after
                 }
@@ -261,7 +271,9 @@ class V3Updater @Inject constructor(
         }
     }
 
-    private suspend fun writeIncrementalUpdate(updatedRepo: AdoptRepos, oldRepo: AdoptRepos): AdoptRepos {
+    private suspend fun writeIncrementalUpdate(
+        updatedRepo: AdoptRepos, oldRepo: AdoptRepos, excludedIds: Set<GitHubId>
+    ): AdoptRepos {
         val checksum = calculateChecksum(updatedRepo)
         val oldChecksum = calculateChecksum(oldRepo)
 
@@ -272,6 +284,13 @@ class V3Updater @Inject constructor(
         return mutex.withLock {
             // Ensure that the database has not been updated since calculating the incremental update
             if (database.getUpdatedAt().checksum == oldChecksum) {
+                val removed = excludedDownloads(oldRepo, updatedRepo, excludedIds)
+                if (!validateStats(updatedRepo, oldRepo, removed)) {
+                    throw InvalidUpdateException("Stats are not sane after exclusions")
+                }
+                // Write accounting first. The previous-snapshot floor in validation prevents
+                // a failed release write from making this adjustment a reusable loss allowance.
+                saveExclusionStats(updatedRepo, oldRepo, removed)
                 database.updateAllRepos(updatedRepo, checksum)
                 database.setReleaseInfo(releaseVersionResolver.formReleaseInfo(updatedRepo))
 
@@ -436,6 +455,20 @@ class V3Updater @Inject constructor(
             return runBlocking {
                 LOGGER.info("Starting Full update {}", releasesOnly)
 
+                val previousChecksum = calculateChecksum(currentRepo)
+                val expectedChecksum = mutex.withLock {
+                    // Capture only after any in-flight publication finishes, even if it fails
+                    // and leaves an incomplete marker. Such a stable marker can still recover.
+                    val storedChecksum = database.getUpdatedAt().checksum
+                    if (storedChecksum != previousChecksum) {
+                        // Loading filters invalid assets and empty features, so its checksum can
+                        // differ from the raw stored checksum without representing a stale snapshot.
+                        val latest = apiDataStore.loadDataFromDb(forceUpdate = true, logEntries = false)
+                        if (calculateChecksum(latest) != previousChecksum) return@runBlocking latest
+                    }
+                    storedChecksum
+                }
+
                 updatableVersionSupplier.updateVersions()
 
                 val filterType: ReleaseFilterType = if (releasesOnly) {
@@ -446,26 +479,33 @@ class V3Updater @Inject constructor(
 
                 val filter = ReleaseIncludeFilter(TimeSource.now(), filterType)
 
-                val newRepoData = adoptReposBuilder.build(filter)
+                // Repository rebuilds run concurrently; exclusions belong only to this attempt.
+                val excludedIds = ConcurrentHashMap.newKeySet<GitHubId>()
+                val newRepoData = adoptReposBuilder.build(filter, currentRepo) { excludedIds.add(it) }
 
-                val repo = copyOldReleasesIntoNewRepo(currentRepo, newRepoData, filter)
+                val repo = copyOldReleasesIntoNewRepo(currentRepo, newRepoData, filter, excludedIds)
+                val removed = excludedDownloads(currentRepo, repo, excludedIds)
 
                 printRepoDebugInfo(currentRepo, repo, null)
 
                 val checksum = calculateChecksum(repo)
 
                 val dataInDb = mutex.withLock {
-                    runBlocking {
-                        if (!validateStats(repo)) {
-                            LOGGER.error("Stats do not look correct, not saving update")
-                            throw InvalidUpdateException("Stats are not sane")
-                        }
-
-                        database.updateAllRepos(repo, checksum)
-                        statsInterface.update(repo)
-                        database.setReleaseInfo(releaseVersionResolver.formReleaseInfo(repo))
-                        apiDataStore.loadDataFromDb(forceUpdate = true, logEntries = false)
+                    val storedChecksum = database.getUpdatedAt().checksum
+                    if (storedChecksum != expectedChecksum) {
+                        LOGGER.warn("Discarding stale full rebuild: $expectedChecksum != $storedChecksum")
+                        return@runBlocking apiDataStore.loadDataFromDb(forceUpdate = true, logEntries = false)
                     }
+                    if (!validateStats(repo, currentRepo, removed)) {
+                        LOGGER.error("Stats do not look correct, not saving update")
+                        throw InvalidUpdateException("Stats are not sane")
+                    }
+
+                    saveExclusionStats(repo, currentRepo, removed)
+                    database.updateAllRepos(repo, checksum)
+                    statsInterface.update(repo)
+                    database.setReleaseInfo(releaseVersionResolver.formReleaseInfo(repo))
+                    apiDataStore.loadDataFromDb(forceUpdate = true, logEntries = false)
                 }
 
                 LOGGER.info("Updating Release Notes")
@@ -526,16 +566,45 @@ class V3Updater @Inject constructor(
 
     class InvalidUpdateException(message: String) : Exception(message)
 
-    private suspend fun validateStats(repo: AdoptRepos): Boolean {
-        return GitHubDownloadStatsCalculator
-            .getStats(repo)
-            .filter { newEntry ->
-                val lastDownloads = database.getLatestGithubStatsForFeatureVersion(newEntry.feature_version)?.downloads ?: 0
+    private fun publicationStats(repo: AdoptRepos, previous: AdoptRepos): List<GitHubDownloadStatsDbEntry> {
+        // A removed feature version must be validated and saved as zero, not disappear from validation.
+        val emptyFeatures = previous.repos.mapValues { (version, _) -> FeatureRelease(version, Releases(emptyList())) }
+        return GitHubDownloadStatsCalculator.getStats(AdoptRepos(emptyFeatures + repo.repos))
+    }
 
-                if (lastDownloads > newEntry.downloads) {
-                    LOGGER.error("Stats for ${newEntry.feature_version} are lower than the latest in the db $lastDownloads > ${newEntry.downloads}")
+    private fun excludedDownloads(previous: AdoptRepos, repo: AdoptRepos, excludedIds: Set<GitHubId>): Map<Int, Long> {
+        val retainedIds = repo.allReleases.nodeList.map { GitHubId(it.id) }.toSet()
+        val excluded = previous.allReleases.nodeList.filter {
+            GitHubId(it.id) !in retainedIds &&
+                (GitHubId(it.id) in excludedIds || ReleaseExclusions.isExcluded(it.release_link, it.release_name))
+        }
+        val byVersion = excluded.groupBy { it.version_data.major }
+            .map { (version, releases) -> FeatureRelease(version, Releases(releases)) }
+        return GitHubDownloadStatsCalculator.getStats(AdoptRepos(byVersion))
+            .filter { it.downloads > 0 }.associate { it.feature_version to it.downloads }
+    }
+
+    private suspend fun saveExclusionStats(repo: AdoptRepos, previous: AdoptRepos, removed: Map<Int, Long>) {
+        val adjusted = publicationStats(repo, previous).filter { it.feature_version in removed }
+        if (adjusted.isNotEmpty()) database.addGithubDownloadStatsEntries(adjusted)
+    }
+
+    private suspend fun validateStats(repo: AdoptRepos, previous: AdoptRepos, removed: Map<Int, Long>): Boolean {
+        val previousStats = GitHubDownloadStatsCalculator.getStats(previous).associateBy { it.feature_version }
+        return publicationStats(repo, previous)
+            .filter { newEntry ->
+                val lastEntry = database.getLatestGithubStatsForFeatureVersion(newEntry.feature_version)
+                val lastDownloads = lastEntry?.downloads ?: 0
+                val allowance = removed[newEntry.feature_version] ?: 0
+                // A saved adjustment may precede a failed release write. Always protect the
+                // previous snapshot too, even when this attempt excludes nothing.
+                val previousDownloads = if (lastEntry != null) previousStats[newEntry.feature_version]?.downloads ?: 0 else 0
+                val minimum = maxOf(lastDownloads, previousDownloads) - allowance
+
+                if (minimum > newEntry.downloads) {
+                    LOGGER.error("Stats for ${newEntry.feature_version} are below the exclusion-adjusted minimum $minimum > ${newEntry.downloads}")
                 }
-                return@filter lastDownloads > newEntry.downloads
+                return@filter minimum > newEntry.downloads
             }
             .isEmpty()
     }
