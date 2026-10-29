@@ -12,6 +12,7 @@ import net.adoptium.api.v3.dataSources.persitence.mongo.MongoApiPersistence
 import net.adoptium.api.v3.dataSources.persitence.mongo.MongoClient
 import net.adoptium.api.v3.models.CloudflarePackageDownloadStatsDbEntry
 import net.adoptium.api.v3.models.GHReleaseMetadata
+import net.adoptium.api.v3.models.Release
 import org.bson.Document
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertNotEquals
@@ -66,7 +67,7 @@ class MongoAPIPersistenceTests : MongoTest() {
         api.updateAllRepos(target, targetChecksum)
         val recovered = MongoApiPersistence(MongoClient())
         assertEquals(setOf(replacement.id), recovered.readReleaseData(8).releases.nodes.keys)
-        assertTrue(recovered.readReleaseData(11).releases.nodes.isEmpty())
+        assertEquals(setOf(omitted.id), recovered.readReleaseData(11).releases.nodes.keys)
         assertEquals(targetChecksum, recovered.getUpdatedAt().checksum)
     }
 
@@ -74,8 +75,9 @@ class MongoAPIPersistenceTests : MongoTest() {
     @ValueSource(booleans = [false, true])
     fun `marker failure propagates original exception without publishing target`(failOnPublish: Boolean): Unit = runBlocking {
         val release = BaseTest.adoptRepos.getFeatureRelease(8)!!.releases.nodeList.first()
+        val replacement = BaseTest.adoptRepos.getFeatureRelease(8)!!.releases.nodeList.drop(1).first()
         val before = AdoptRepos(listOf(FeatureRelease(8, Releases(listOf(release)))))
-        val target = AdoptRepos(emptyList())
+        val target = AdoptRepos(listOf(FeatureRelease(8, Releases(listOf(replacement)))))
         val oldChecksum = V3Updater.calculateChecksum(before)
         val targetChecksum = V3Updater.calculateChecksum(target)
         val failure = IllegalStateException("Injected generation write failure")
@@ -95,7 +97,7 @@ class MongoAPIPersistenceTests : MongoTest() {
         assertNotEquals(targetChecksum, restarted.getUpdatedAt().checksum)
         if (failOnPublish) {
             assertNotEquals(oldChecksum, restarted.getUpdatedAt().checksum)
-            assertTrue(restarted.readReleaseData(8).releases.nodes.isEmpty())
+            assertEquals(setOf(replacement.id), restarted.readReleaseData(8).releases.nodes.keys)
         } else {
             // Failed invalidation must prevent all destructive release writes.
             assertEquals(oldChecksum, restarted.getUpdatedAt().checksum)
@@ -104,11 +106,11 @@ class MongoAPIPersistenceTests : MongoTest() {
         fail = false
         api.updateAllRepos(target, targetChecksum)
         assertEquals(targetChecksum, restarted.getUpdatedAt().checksum)
-        assertTrue(restarted.readReleaseData(8).releases.nodes.isEmpty())
+        assertEquals(setOf(replacement.id), restarted.readReleaseData(8).releases.nodes.keys)
     }
 
     @Test
-    fun `complete empty snapshot removes every persisted feature`(): Unit = runBlocking {
+    fun `empty snapshot retains persisted features across a restart`(): Unit = runBlocking {
         val api = MongoApiPersistence(MongoClient())
         val before = AdoptRepos(listOf(8, 11).map { version ->
             FeatureRelease(version, Releases(listOf(BaseTest.adoptRepos.getFeatureRelease(version)!!.releases.nodeList.first())))
@@ -119,30 +121,59 @@ class MongoAPIPersistenceTests : MongoTest() {
         api.updateAllRepos(target, checksum)
 
         val restarted = MongoApiPersistence(MongoClient())
-        for (version in 8..100) assertTrue(restarted.readReleaseData(version).releases.nodes.isEmpty())
+        for ((version, releases) in before.repos) {
+            val stored = restarted.readReleaseData(version)
+            assertEquals(releases.releases.nodes, stored.releases.nodes)
+            for (release in releases.releases.nodeList) {
+                assertEquals(release.download_count, stored.releases.nodes[release.id]!!.download_count)
+            }
+        }
         assertEquals(checksum, restarted.getUpdatedAt().checksum)
         assertEquals(target.hashCode(), restarted.getUpdatedAt().hashCode)
     }
 
     @ParameterizedTest
     @ValueSource(booleans = [false, true])
-    fun `empty and omitted features are deleted from Mongo`(omit: Boolean): Unit = runBlocking {
+    fun `empty and omitted features retain internal releases while other features update`(omit: Boolean): Unit = runBlocking {
         val api = MongoApiPersistence(MongoClient())
-        val removed = BaseTest.adoptRepos.getFeatureRelease(8)!!.releases.nodeList.first()
-        val retained = BaseTest.adoptRepos.getFeatureRelease(11)!!.releases.nodeList.first()
+        val retained = Release(BaseTest.adoptRepos.getFeatureRelease(8)!!.releases.nodeList.first(), emptyArray())
+        val oldRelease = BaseTest.adoptRepos.getFeatureRelease(11)!!.releases.nodeList.first()
+        val replacement = BaseTest.adoptRepos.getFeatureRelease(11)!!.releases.nodeList.drop(1).first()
         val before = AdoptRepos(listOf(
-            FeatureRelease(8, Releases(listOf(removed))), FeatureRelease(11, Releases(listOf(retained)))
+            FeatureRelease(8, Releases(listOf(retained))), FeatureRelease(11, Releases(listOf(oldRelease)))
         ))
         api.updateAllRepos(before, "before-empty-feature")
-        assertEquals(setOf(removed.id), api.readReleaseData(8).releases.nodes.keys)
-        val after = AdoptRepos(listOf(FeatureRelease(11, Releases(listOf(retained)))) +
+        assertEquals(setOf(retained.id), api.readReleaseData(8).releases.nodes.keys)
+        val after = AdoptRepos(listOf(FeatureRelease(11, Releases(listOf(replacement)))) +
             if (omit) emptyList() else listOf(FeatureRelease(8, Releases(emptyList()))))
         api.updateAllRepos(after, "after-empty-feature")
 
         val restarted = MongoApiPersistence(MongoClient())
-        assertTrue(restarted.readReleaseData(8).releases.nodes.isEmpty())
-        assertEquals(setOf(retained.id), restarted.readReleaseData(11).releases.nodes.keys)
+        val stored = restarted.readReleaseData(8).releases.nodes
+        assertEquals(setOf(retained.id), stored.keys)
+        val preserved = stored.getValue(retained.id)
+        assertEquals(retained, preserved)
+        assertEquals(retained.download_count, preserved.download_count)
+        assertEquals(setOf(replacement.id), restarted.readReleaseData(11).releases.nodes.keys)
         assertEquals("after-empty-feature", restarted.getUpdatedAt().checksum)
+    }
+
+    @Test
+    fun `nonempty feature replacement removes obsolete releases without deleting omitted features`(): Unit = runBlocking {
+        val api = MongoApiPersistence(MongoClient())
+        val releases = BaseTest.adoptRepos.getFeatureRelease(8)!!.releases.nodeList.take(2)
+        val retained = BaseTest.adoptRepos.getFeatureRelease(11)!!.releases.nodeList.first()
+        val before = AdoptRepos(listOf(
+            FeatureRelease(8, Releases(releases)), FeatureRelease(11, Releases(listOf(retained)))
+        ))
+        api.updateAllRepos(before, "before-replacement")
+        val replacement = releases.last()
+        api.updateAllRepos(AdoptRepos(listOf(FeatureRelease(8, Releases(listOf(replacement))))), "after-replacement")
+
+        val restarted = MongoApiPersistence(MongoClient())
+        assertEquals(setOf(replacement.id), restarted.readReleaseData(8).releases.nodes.keys)
+        assertEquals(setOf(retained.id), restarted.readReleaseData(11).releases.nodes.keys)
+        assertEquals("after-replacement", restarted.getUpdatedAt().checksum)
     }
 
     @Test

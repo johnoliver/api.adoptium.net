@@ -58,6 +58,13 @@ scenarios, not a request to implement whole-version deletion. Incremental
 discovery of supported versions missing from the in-memory catalogue remains in
 place, but does not guarantee durable removal of an entire feature version.
 
+This is the chosen narrow scope: neither an absent feature version, an
+explicitly empty feature version, nor an entirely empty replacement catalogue
+authorizes MongoDB to delete that version's existing records. Non-empty feature
+versions still replace their previous records, including removing obsolete
+releases within those versions. Consequently an empty in-memory result is not
+a durable whole-version deletion request.
+
 The failure outcomes below are explicit policy choices, not assumptions that
 failures cannot occur: prefer a stale complete EA on incremental failure, omit
 a failed EA during a full rebuild, and reject incomplete binary snapshots except
@@ -70,6 +77,29 @@ remembered by the mapper. This differs from `upstream/main`, where these mapping
 failures are retryable. It is an explicit branch policy, not an assumption that
 malformed releases cannot be corrected upstream or a promise that they will
 recover on any particular cycle.
+
+## Acceptance invariants
+
+These are the contracts against which implementations and review findings must
+be evaluated, not a declaration that all paths already satisfy them. Each needs
+an owning boundary and a regression that exercises its failure case.
+Whole-feature-version disappearance remains subject to the limitation above;
+do not expand that scope to make a regression pass.
+
+| ID | Invariant | Owning boundary and required scenario |
+| --- | --- | --- |
+| I1 | Updater baselines include persisted releases and download attribution independently of API visibility filters or serving-version caps. | Updater snapshot loading: include a zero-binary release and a version above the frontend cap. |
+| I2 | A replacement cannot silently discard newer published work within a feature version it replaces. | Build-to-publication handoff: publish an incremental change after the full-build baseline is captured, then attempt the stale full publication. |
+| I3 | Partial publication is never accepted as a committed generation. Recovery read failure cannot become an empty successful baseline. | Mongo publication and snapshot loading: fail invalidation, release writes, final publication, or recovery reads; repeat after restart. |
+| I4 | One upstream release is replaced as a complete set of splits, never a mixture of refreshed and stale binaries. Failures follow the update-mode policies below. | Mapping and builders: fail one required sidecar in a multi-binary release under both full and incremental updates, retaining explicit per-artifact checksum exclusions. |
+| I5 | Non-empty feature replacements remove obsolete releases; missing or empty features preserve stored records. Download-loss guards account for stored and rebuilt versions, including versions absent from the candidate. | Mongo persistence and the full-update guard: exercise absent, explicitly empty, and partially populated feature versions separately and assert download totals explicitly. |
+| I6 | Asset-list ordering cannot hide an available, unambiguous sidecar or change checksum decisions. | Sidecar selection: permute exact matches, ambiguous aliases and valid more-specific aliases. |
+| I7 | Per-key cache-write ordering survives cancellation, without mixing asset identities or turning pending-fetch sharing into indefinite URL-only caching. | Cache client and persistence: cancel during a blocked database write, then fetch newer content; also exercise identity changes and later URL-only requests. |
+
+Use real MongoDB coverage for persistence semantics rather than inferring them
+from an in-memory replacement double. For I5, retaining records for absent or
+empty versions across a restart is intentional; their reappearance after reload
+is the accepted limitation, not evidence that deletion must be added.
 
 ## Decision
 
@@ -273,7 +303,8 @@ guarantee rollback of a database failure after publication has begun.
 Publication to MongoDB is not atomic, so the generation marker guards it. Before
 changing any release, a fresh `incomplete:<uuid>` marker replaces the published
 checksum; the target checksum is written only after every feature version has
-been written and feature versions absent from the snapshot have been deleted. A
+been processed. Only non-empty feature versions replace stored records; absent
+and explicitly empty feature versions are left unchanged under the scope above. A
 failure therefore leaves a marker that matches neither the previous nor the
 target generation. Readers reject an incomplete marker, or a marker that changes
 while loading, and keep serving their cached catalogue. Incremental updates defer

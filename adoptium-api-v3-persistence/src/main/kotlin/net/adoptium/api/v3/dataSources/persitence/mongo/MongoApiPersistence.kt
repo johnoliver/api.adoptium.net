@@ -88,8 +88,6 @@ open class MongoApiPersistence @Inject constructor(mongoClient: MongoClient) : M
         repos.repos.forEach { (version, releases) ->
             writeReleases(version, releases)
         }
-        // A complete snapshot also removes feature versions it no longer contains.
-        releasesCollection.deleteMany(Document("version_data.major", Document("\$nin", repos.repos.keys.toList())))
         updateUpdatedTime(TimeSource.now(), checksum, repos.hashCode())
     }
 
@@ -110,8 +108,9 @@ open class MongoApiPersistence @Inject constructor(mongoClient: MongoClient) : M
 
     private suspend fun writeReleases(featureVersion: Int, value: FeatureRelease) {
         val toAdd = value.releases.getReleases().toList()
-        releasesCollection.deleteMany(majorVersionMatcher(featureVersion))
+        // Empty features are not whole-version deletion requests; see ADR 8.
         if (toAdd.isNotEmpty()) {
+            releasesCollection.deleteMany(majorVersionMatcher(featureVersion))
             releasesCollection.insertMany(toAdd, InsertManyOptions())
         }
     }
