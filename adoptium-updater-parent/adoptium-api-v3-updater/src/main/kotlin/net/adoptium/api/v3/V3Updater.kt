@@ -13,13 +13,17 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import net.adoptium.api.v3.config.APIConfig
 import net.adoptium.api.v3.dataSources.APIDataStore
+import net.adoptium.api.v3.dataSources.APIDataStoreImpl
 import net.adoptium.api.v3.dataSources.ReleaseVersionResolver
 import net.adoptium.api.v3.dataSources.UpdatableVersionSupplier
 import net.adoptium.api.v3.dataSources.UpdaterJsonMapper
 import net.adoptium.api.v3.dataSources.models.AdoptRepos
 import net.adoptium.api.v3.dataSources.models.AdoptCdxaRepos
+import net.adoptium.api.v3.dataSources.models.GitHubId
 import net.adoptium.api.v3.dataSources.persitence.ApiPersistence
 import net.adoptium.api.v3.models.Release
+import net.adoptium.api.v3.models.ReleaseType
+import net.adoptium.api.v3.models.Vendor
 import net.adoptium.api.v3.releaseNotes.AdoptReleaseNotes
 import net.adoptium.api.v3.stats.GitHubDownloadStatsCalculator
 import net.adoptium.api.v3.stats.StatsInterface
@@ -270,6 +274,11 @@ class V3Updater @Inject constructor(
         }
 
         return mutex.withLock {
+            // A failed publication leaves a partial database; only a full rebuild can complete it.
+            if (database.getUpdatedAt().isIncomplete()) {
+                LOGGER.warn("Deferring incremental update until a full rebuild replaces the incomplete publication")
+                return@withLock oldRepo
+            }
             // Ensure that the database has not been updated since calculating the incremental update
             if (database.getUpdatedAt().checksum == oldChecksum) {
                 database.updateAllRepos(updatedRepo, checksum)
@@ -283,7 +292,7 @@ class V3Updater @Inject constructor(
                 LOGGER.warn("Not applying incremental update due to checksum miss $checksum ${updatedRepo.hashCode()} $oldChecksum ${oldRepo.hashCode()} ${database.getUpdatedAt().checksum}")
 
                 // re-calculate checksum in case of schema change
-                val dbVersion = apiDataStore.loadDataFromDb(true)
+                val dbVersion = APIDataStoreImpl.loadUpdaterSnapshot(database)
                 val dbChecksum = calculateChecksum(dbVersion)
                 if (dbChecksum != database.getUpdatedAt().checksum) {
                     database.updateAllRepos(dbVersion, dbChecksum)
@@ -326,15 +335,24 @@ class V3Updater @Inject constructor(
         }
     }
 
+    // An incomplete generation is not servable, but the rebuild still needs its surviving records
+    // so that releases outside the first rebuild's filter are not deleted.
+    private fun loadRecoveryBaseline(): AdoptRepos {
+        return try {
+            APIDataStoreImpl.loadRecoveryBaseline(database)
+        } catch (e: Exception) {
+            LOGGER.error("Failed to load recovery baseline; refusing to start updates", e)
+            throw e
+        }
+    }
+
     fun run(instantFullUpdate: Boolean) {
         assertConnectedToDb()
-
-        val executor = Executors.newScheduledThreadPool(2)
 
         val delay = if (instantFullUpdate) 0L else 1L
 
         var repo: AdoptRepos = try {
-            apiDataStore.loadDataFromDb(true)
+            APIDataStoreImpl.loadUpdaterSnapshot(database)
         } catch (e: java.lang.Exception) {
             LOGGER.error("Failed to load db", e)
             if (e is MongoException) {
@@ -342,7 +360,7 @@ class V3Updater @Inject constructor(
                 Quarkus.asyncExit(2)
                 Quarkus.waitForExit()
             }
-            AdoptRepos(emptyList())
+            loadRecoveryBaseline()
         }
 
         var cdxaRepo: AdoptCdxaRepos = try {
@@ -357,6 +375,7 @@ class V3Updater @Inject constructor(
             AdoptCdxaRepos(emptyList())
         } 
 
+        val executor = Executors.newScheduledThreadPool(2)
         val incrementalUpdateScheduled = AtomicBoolean(false)
         val incrementalCdxaUpdateScheduled = AtomicBoolean(false)
 
@@ -530,12 +549,27 @@ class V3Updater @Inject constructor(
         return GitHubDownloadStatsCalculator
             .getStats(repo)
             .filter { newEntry ->
-                val lastDownloads = database.getLatestGithubStatsForFeatureVersion(newEntry.feature_version)?.downloads ?: 0
+                val newReleases = repo.repos.getValue(newEntry.feature_version).releases
 
-                if (lastDownloads > newEntry.downloads) {
-                    LOGGER.error("Stats for ${newEntry.feature_version} are lower than the latest in the db $lastDownloads > ${newEntry.downloads}")
+                // The stored snapshot is what this update replaces. Saved stats are not used: a failed stats
+                // write after a published omission would leave them stale and reject healthy rebuilds.
+                // Unlike the API view the snapshot keeps releases whose binaries were all excluded.
+                val stored = database.readReleaseData(newEntry.feature_version).releases.getReleases()
+                    .filter { it.vendor == Vendor.getDefault() }
+                    .toList()
+                val storedDownloads = stored.sumOf { it.download_count }
+                val omittedEaDownloads = stored
+                    .filter { it.release_type == ReleaseType.ea && !newReleases.hasReleaseId(GitHubId(it.id)) }
+                    .sumOf { it.download_count }
+                val baselineDownloads = storedDownloads
+                // Full builds may omit failed EAs without invalidating an otherwise
+                // healthy rebuild. Do not exempt losses from retained EAs or GAs.
+                val comparableDownloads = newEntry.downloads + omittedEaDownloads
+
+                if (baselineDownloads > comparableDownloads) {
+                    LOGGER.error("Stats for ${newEntry.feature_version} are lower than the latest in the db $baselineDownloads > $comparableDownloads (omitted EA downloads: $omittedEaDownloads)")
                 }
-                return@filter lastDownloads > newEntry.downloads
+                return@filter baselineDownloads > comparableDownloads
             }
             .isEmpty()
     }
