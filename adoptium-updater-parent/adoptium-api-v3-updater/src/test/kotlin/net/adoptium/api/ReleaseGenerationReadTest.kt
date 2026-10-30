@@ -57,12 +57,24 @@ class ReleaseGenerationReadTest {
     }
 
     @Test
+    fun `updater snapshot rejects generation changes during its complete raw read`() {
+        val database = mockk<ApiPersistence>()
+        coEvery { database.getUpdatedAt() } returnsMany listOf(previous, previous.copy(checksum = "newer"))
+        coEvery { database.readAllReleaseData() } returns empty
+
+        assertThrows(IllegalStateException::class.java) {
+            APIDataStoreImpl.loadUpdaterSnapshotWithInfo(database)
+        }
+        coVerify(exactly = 1) { database.readAllReleaseData() }
+    }
+
+    @Test
     fun `recovery baseline reads the surviving records of an incomplete generation`() {
         val database = mockk<ApiPersistence>()
         coEvery { database.getUpdatedAt() } returns previous.copy(checksum = "incomplete:failed")
-        coEvery { database.readReleaseData(any()) } returns FeatureRelease(8, emptyList())
+        coEvery { database.readAllReleaseData() } returns empty
         APIDataStoreImpl.loadRecoveryBaseline(database)
-        coVerify { database.readReleaseData(8) }
+        coVerify { database.readAllReleaseData() }
     }
 
     @ParameterizedTest
@@ -75,7 +87,7 @@ class ReleaseGenerationReadTest {
         }
         val database = mockk<ApiPersistence>()
         coEvery { database.getUpdatedAt() } returns previous.copy(checksum = "incomplete:failed")
-        coEvery { database.readReleaseData(8) } throws failure
+        coEvery { database.readAllReleaseData() } throws failure
         val store = mockk<APIDataStore>()
         coEvery { store.isConnectedToDb() } returns true
         every { store.loadCdxaDataFromDb(any(), any()) } throws AssertionError("Startup continued without a recovery baseline")

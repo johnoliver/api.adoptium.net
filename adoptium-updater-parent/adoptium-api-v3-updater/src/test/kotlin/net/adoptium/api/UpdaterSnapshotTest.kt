@@ -16,6 +16,7 @@ import net.adoptium.api.v3.dataSources.models.Releases
 import net.adoptium.api.v3.models.JvmImpl
 import net.adoptium.api.v3.models.Release
 import net.adoptium.api.v3.models.Vendor
+import net.adoptium.api.v3.models.VersionData
 import org.junit.jupiter.api.Assertions.*
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.params.ParameterizedTest
@@ -32,6 +33,23 @@ class UpdaterSnapshotTest {
         healthy.vendor, healthy.version_data
     )
     private val before = AdoptRepos(listOf(FeatureRelease(8, Releases(listOf(healthy, hidden)))))
+
+    @Test
+    fun `updater and recovery snapshots are independent of the frontend version cap`() = runBlocking {
+        val version = (System.getenv("MAX_VERSION_TO_LOAD") ?: "100").toInt() + 1
+        val aboveCap = Release("above-cap", hidden.release_type, hidden.release_link, hidden.release_name,
+            hidden.timestamp, hidden.updated_at, emptyArray(), hidden.download_count, hidden.vendor,
+            VersionData(version, 0, 0, null, null, 1, null, ""))
+        val stored = before.addRelease(version, aboveCap)
+        val database = InMemoryApiPersistence(stored, AdoptCdxaRepos(emptyList()))
+        database.updateAllRepos(stored, V3Updater.calculateChecksum(stored))
+
+        assertNull(APIDataStoreImpl(database).loadDataFromDb(true).getFeatureRelease(version))
+        for (snapshot in listOf(APIDataStoreImpl.loadUpdaterSnapshot(database), APIDataStoreImpl.loadRecoveryBaseline(database))) {
+            assertEquals(aboveCap.download_count, snapshot.allReleases.nodes.getValue(aboveCap.id).download_count)
+            assertEquals(V3Updater.calculateChecksum(stored), V3Updater.calculateChecksum(snapshot))
+        }
+    }
 
     @ParameterizedTest
     @ValueSource(booleans = [false, true])

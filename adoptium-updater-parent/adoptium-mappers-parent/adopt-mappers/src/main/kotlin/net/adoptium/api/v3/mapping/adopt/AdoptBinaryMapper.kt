@@ -1,5 +1,6 @@
 package net.adoptium.api.v3.mapping.adopt
 
+import com.mongodb.MongoException
 import jakarta.enterprise.context.ApplicationScoped
 import jakarta.inject.Inject
 import kotlinx.coroutines.CancellationException
@@ -93,6 +94,7 @@ class AdoptBinaryMapper @Inject constructor(private val gitHubHtmlClient: GitHub
                 LOGGER.error("Excluding binary ${ghBinaryAsset.name}: ${e.message}")
                 BinaryMappingResult(null, checksumMismatch = true)
             } catch (e: Exception) {
+                if (e is MongoException) throw e
                 LOGGER.error("Failed to fetch binary ${ghBinaryAsset.name}", e)
                 BinaryMappingResult(null)
             }
@@ -156,6 +158,7 @@ class AdoptBinaryMapper @Inject constructor(private val gitHubHtmlClient: GitHub
                 LOGGER.error("Excluding installer ${installer.name}: ${e.message}")
                 return null
             } catch (e: Exception) {
+                if (e is MongoException) throw e
                 LOGGER.error("Excluding installer ${installer.name} after metadata/checksum validation failed", e)
                 return null
             }
@@ -206,21 +209,23 @@ class AdoptBinaryMapper @Inject constructor(private val gitHubHtmlClient: GitHub
         getSidecarAsset(fullAssetList, binary_name, ".json")
 
     private fun sidecarAliases(name: String, suffix: String) =
-        setOf(name.split(".")[0] + suffix, removeExtensionFromName(name) + suffix)
+        setOf(removeExtensionFromName(name) + suffix, name.substringBefore(".") + suffix)
 
     // A sidecar named only by the shared stem (foo.sha256.txt for foo.zip and foo.msi) cannot be
     // attributed to one artifact, so it is unavailable to each unless the others have their own exact sidecar.
     private fun getSidecarAsset(fullAssetList: List<GHAsset>, binary_name: String, suffix: String): GHAsset? {
         fullAssetList.firstOrNull { it.name == "$binary_name$suffix" }?.let { return it }
-        val aliases = sidecarAliases(binary_name, suffix)
-        val alias = fullAssetList.firstOrNull { it.name in aliases } ?: return null
-        val competes = fullAssetList.any { other ->
-            other.name != binary_name &&
-                BINARY_ASSET_WHITELIST.any { other.name.endsWith(it) } &&
-                alias.name in sidecarAliases(other.name, suffix) &&
-                fullAssetList.none { it.name == "${other.name}$suffix" }
+        for (name in sidecarAliases(binary_name, suffix)) {
+            val alias = fullAssetList.firstOrNull { it.name == name } ?: continue
+            val competes = fullAssetList.any { other ->
+                other.name != binary_name &&
+                    BINARY_ASSET_WHITELIST.any { other.name.endsWith(it) } &&
+                    alias.name in sidecarAliases(other.name, suffix) &&
+                    fullAssetList.none { it.name == "${other.name}$suffix" }
+            }
+            if (!competes) return alias
         }
-        return if (competes) null else alias
+        return null
     }
 
     private fun removeExtensionFromName(binary_name: String): String {
@@ -336,6 +341,7 @@ class AdoptBinaryMapper @Inject constructor(private val gitHubHtmlClient: GitHub
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
+            if (e is MongoException) throw e
             LOGGER.warn("Failed to fetch checksum ${checksumAsset?.downloadUrl}", e)
         }
         return null

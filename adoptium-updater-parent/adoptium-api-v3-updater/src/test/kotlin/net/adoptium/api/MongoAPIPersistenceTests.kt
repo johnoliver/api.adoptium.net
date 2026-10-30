@@ -8,11 +8,13 @@ import net.adoptium.api.v3.dataSources.models.GitHubId
 import net.adoptium.api.v3.dataSources.models.AdoptRepos
 import net.adoptium.api.v3.dataSources.models.FeatureRelease
 import net.adoptium.api.v3.dataSources.models.Releases
+import net.adoptium.api.v3.dataSources.APIDataStoreImpl
 import net.adoptium.api.v3.dataSources.persitence.mongo.MongoApiPersistence
 import net.adoptium.api.v3.dataSources.persitence.mongo.MongoClient
 import net.adoptium.api.v3.models.CloudflarePackageDownloadStatsDbEntry
 import net.adoptium.api.v3.models.GHReleaseMetadata
 import net.adoptium.api.v3.models.Release
+import net.adoptium.api.v3.models.VersionData
 import org.bson.Document
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertNotEquals
@@ -25,6 +27,24 @@ import org.junit.jupiter.params.provider.ValueSource
 import java.time.ZonedDateTime
 
 class MongoAPIPersistenceTests : MongoTest() {
+
+    @Test
+    fun `raw updater snapshot loads all persisted feature versions and internal download counts`(): Unit = runBlocking {
+        val api = MongoApiPersistence(MongoClient())
+        val template = BaseTest.adoptRepos.getFeatureRelease(8)!!.releases.nodeList.first()
+        val version = (System.getenv("MAX_VERSION_TO_LOAD") ?: "100").toInt() + 1
+        val internal = Release("above-serving-cap", template.release_type, template.release_link, template.release_name,
+            template.timestamp, template.updated_at, emptyArray(), 123, template.vendor,
+            VersionData(version, 0, 0, null, null, 1, null, ""))
+        api.updateAllRepos(AdoptRepos(listOf(FeatureRelease(version, Releases(listOf(internal))))), "all-versions")
+
+        val restarted = MongoApiPersistence(MongoClient())
+        val (snapshot, generation) = APIDataStoreImpl.loadUpdaterSnapshotWithInfo(restarted)
+        val stored = snapshot.getFeatureRelease(version)!!.releases.nodes.getValue(internal.id)
+        assertEquals(internal, stored)
+        assertEquals(123L, stored.download_count)
+        assertEquals("all-versions", generation.checksum)
+    }
 
     @Test
     fun `partial insert failure invalidates generation and permits recovery`(): Unit = runBlocking {

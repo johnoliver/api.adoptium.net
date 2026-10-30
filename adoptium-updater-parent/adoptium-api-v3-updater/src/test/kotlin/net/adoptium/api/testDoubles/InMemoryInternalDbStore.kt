@@ -3,7 +3,8 @@ package net.adoptium.api.testDoubles
 import jakarta.annotation.Priority
 import jakarta.enterprise.context.ApplicationScoped
 import jakarta.enterprise.inject.Alternative
-import kotlinx.coroutines.Job
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Deferred
 import net.adoptium.api.v3.TimeSource
 import net.adoptium.api.v3.dataSources.mongo.CacheDbEntry
 import net.adoptium.api.v3.dataSources.mongo.InternalDbStore
@@ -15,14 +16,14 @@ import java.util.concurrent.ConcurrentHashMap
 @ApplicationScoped
 class InMemoryInternalDbStore : InternalDbStore {
     private val cache = ConcurrentHashMap<String, CacheDbEntry>()
-    override fun putCachedWebpage(url: String, lastModified: String?, date: ZonedDateTime, data: String?, accessedAt: ZonedDateTime?): Job {
+    override fun putCachedWebpage(url: String, lastModified: String?, date: ZonedDateTime, data: String?, accessedAt: ZonedDateTime?): Deferred<Unit> {
         cache.compute(url) { _, entry ->
             val lastAccessed = entry?.lastAccessed
             val usage = if (accessedAt == null) lastAccessed ?: date
                 else if (lastAccessed == null || lastAccessed.isBefore(accessedAt)) accessedAt else lastAccessed
             CacheDbEntry(url, lastModified, date, data, usage)
         }
-        return Job().apply { complete() }
+        return CompletableDeferred(Unit)
     }
 
     override suspend fun getCachedWebpage(url: String): CacheDbEntry? {

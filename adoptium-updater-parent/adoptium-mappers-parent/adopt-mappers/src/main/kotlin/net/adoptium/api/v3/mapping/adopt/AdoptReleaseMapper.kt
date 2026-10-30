@@ -1,5 +1,6 @@
 package net.adoptium.api.v3.mapping.adopt
 
+import com.mongodb.MongoException
 import jakarta.enterprise.context.ApplicationScoped
 import jakarta.inject.Inject
 import kotlinx.coroutines.CancellationException
@@ -70,6 +71,7 @@ private class AdoptReleaseMapper(
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
+            if (e is MongoException) throw e
             // Required sidecars must form a complete split snapshot. Do not
             // exclude the release permanently: a later refresh can retry it.
             LOGGER.error("Failed to retrieve metadata for $releaseName", e)
@@ -112,6 +114,7 @@ private class AdoptReleaseMapper(
             LOGGER.error("Failed to parse $releaseName", e)
             return ReleaseResult(error = "Failed to parse $releaseName")
         } catch (e: Exception) {
+            if (e is MongoException) throw e
             LOGGER.error("Failed to map $releaseName", e)
             return ReleaseResult(error = "Failed to map $releaseName", retryable = true)
         }

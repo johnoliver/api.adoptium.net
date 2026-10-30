@@ -33,6 +33,15 @@ snapshot, while a full rebuild omits that failed EA rather than carrying its old
 splits forward. Other releases continue updating, and failed new EAs remain
 unpublished. Full builds still abort on GA failures or repository-wide release-list
 retrieval/pagination failures.
+Forced legacy rebuilds (`UPDATE_ADOPTOPENJDK=true`) are exceptional and do not
+guarantee per-EA failure isolation; normal full builds preserve legacy data.
+MongoDB reads and repeat-safe writes, including metadata-cache operations, get up
+to three application-level attempts for known transient failures, with 100 ms
+and 200 ms cancellable backoff. Append-only inserts and complete publications are
+not replayed. Permanent errors or exhausted retry budgets abandon the current
+update attempt without higher-level retry. Scheduled tasks remain active for
+later attempts, and incomplete-publication checks prevent serving a partially
+written catalogue.
 Incremental discovery includes supported Java versions absent from the stored
 catalogue, so omitting a version's only EA does not prevent later recovery.
 See [ADR 8: release snapshot update semantics and failure isolation](adr/0008-release-snapshot-update-semantics.md)

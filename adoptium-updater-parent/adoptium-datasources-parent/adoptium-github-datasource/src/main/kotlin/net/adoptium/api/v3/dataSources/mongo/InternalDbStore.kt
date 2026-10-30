@@ -7,11 +7,10 @@ import com.mongodb.client.model.ReturnDocument
 import com.mongodb.kotlin.client.coroutine.MongoCollection
 import jakarta.enterprise.context.ApplicationScoped
 import jakarta.inject.Inject
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.GlobalScope
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.launch
+import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.toList
 import net.adoptium.api.v3.TimeSource
 import net.adoptium.api.v3.dataSources.persitence.mongo.MongoClient
@@ -30,7 +29,7 @@ interface InternalDbStore {
     }
 
     // Background writes preserve usage; demand writes advance it monotonically.
-    fun putCachedWebpage(url: String, lastModified: String?, date: ZonedDateTime, data: String?, accessedAt: ZonedDateTime? = null): Job
+    fun putCachedWebpage(url: String, lastModified: String?, date: ZonedDateTime, data: String?, accessedAt: ZonedDateTime? = null): Deferred<Unit>
     suspend fun getCachedWebpage(url: String): CacheDbEntry?
     suspend fun updateCheckedTime(url: String, dateTime: ZonedDateTime)
 }
@@ -41,36 +40,47 @@ open class InternalDbStoreImpl @Inject constructor(mongoClient: MongoClient) : M
 
     init {
         runBlocking {
-            val urlIndex = webCache.listIndexes<Document>().toList()
+            val urlIndex = retryMongoOperation("read cache indexes") { webCache.listIndexes<Document>().toList() }
                 .singleOrNull { it["key"] == Document("url", 1) }
             if (urlIndex?.getBoolean("unique", false) != true) {
                 // Duplicate content has no trustworthy ordering. Invalidate those keys and refetch.
-                webCache.aggregate<Document>(listOf(
-                    Document($$"$group", Document("_id", $$"$url").append("count", Document($$"$sum", 1))),
-                    Document($$"$match", Document("count", Document($$"$gt", 1)))
-                )).collect { duplicate ->
-                    val removed = webCache.deleteMany(Document("url", duplicate["_id"])).deletedCount
+                val duplicates = retryMongoOperation("read duplicate cache keys") {
+                    webCache.aggregate<Document>(listOf(
+                        Document($$"$group", Document("_id", $$"$url").append("count", Document($$"$sum", 1))),
+                        Document($$"$match", Document("count", Document($$"$gt", 1)))
+                    )).toList()
+                }
+                for (duplicate in duplicates) {
+                    val removed = retryMongoOperation("delete duplicate cache entries") {
+                        webCache.deleteMany(Document("url", duplicate["_id"])).deletedCount
+                    }
                     LoggerFactory.getLogger(InternalDbStoreImpl::class.java)
                         .warn("Invalidated {} duplicate cache entries for {}", removed, duplicate["_id"])
                 }
-                if (urlIndex != null) webCache.dropIndex(urlIndex.getString("name"))
+                if (urlIndex != null) retryMongoOperation("drop nonunique cache index") {
+                    webCache.dropIndex(urlIndex.getString("name"))
+                }
             }
-            webCache.createIndex(Document("url", 1), IndexOptions().unique(true).background(true))
+            retryMongoOperation("create unique cache index") {
+                webCache.createIndex(Document("url", 1), IndexOptions().unique(true).background(true))
+            }
             // Old entries have no usage history. Give them one retention period to
             // be reused rather than treating a possibly ancient validation as last use.
-            webCache.updateMany(
-                Document("lastAccessed", null),
-                Document($$"$set", Document("lastAccessed", Date.from(TimeSource.now().toInstant())))
-            )
-            webCache.createIndex(
-                Document("lastAccessed", 1),
-                IndexOptions().expireAfter(InternalDbStore.CACHE_RETENTION_DAYS, TimeUnit.DAYS)
-            )
+            val initialAccessTime = Date.from(TimeSource.now().toInstant())
+            retryMongoOperation("initialize cache usage") {
+                webCache.updateMany(Document("lastAccessed", null), Document($$"$set", Document("lastAccessed", initialAccessTime)))
+            }
+            retryMongoOperation("create cache retention index") {
+                webCache.createIndex(
+                    Document("lastAccessed", 1),
+                    IndexOptions().expireAfter(InternalDbStore.CACHE_RETENTION_DAYS, TimeUnit.DAYS)
+                )
+            }
         }
     }
 
-    override fun putCachedWebpage(url: String, lastModified: String?, date: ZonedDateTime, data: String?, accessedAt: ZonedDateTime?): Job {
-        return GlobalScope.launch {
+    override fun putCachedWebpage(url: String, lastModified: String?, date: ZonedDateTime, data: String?, accessedAt: ZonedDateTime?): Deferred<Unit> {
+        return GlobalScope.async {
             val update = Document($$"$set", Document("lastModified", lastModified)
                 .append("lastChecked", Date.from(date.toInstant()))
                 .append("data", data))
@@ -79,29 +89,33 @@ open class InternalDbStoreImpl @Inject constructor(mongoClient: MongoClient) : M
             } else {
                 update.append($$"$max", Document("lastAccessed", Date.from(accessedAt.toInstant())))
             }
-            webCache.updateOne(
-                Document("url", url),
-                update,
-                UpdateOptions().upsert(true)
-            )
+            retryMongoOperation("write cached webpage") {
+                webCache.updateOne(Document("url", url), update, UpdateOptions().upsert(true))
+            }
+            Unit
         }
     }
 
     override suspend fun getCachedWebpage(url: String): CacheDbEntry? {
-        return webCache.findOneAndUpdate(
-            Document("url", url),
-            Document($$"$max", Document("lastAccessed", Date.from(TimeSource.now().toInstant()))),
-            FindOneAndUpdateOptions().returnDocument(ReturnDocument.AFTER)
-        )
+        val accessedAt = Date.from(TimeSource.now().toInstant())
+        return retryMongoOperation("read and touch cached webpage") {
+            webCache.findOneAndUpdate(
+                Document("url", url),
+                Document($$"$max", Document("lastAccessed", accessedAt)),
+                FindOneAndUpdateOptions().returnDocument(ReturnDocument.AFTER)
+            )
+        }
     }
 
     override suspend fun updateCheckedTime(url: String, dateTime: ZonedDateTime) {
-        webCache.updateOne(
-            Document("url", url),
-            BsonDocument(
-                $$"$set",
-                BsonDocument("lastChecked", BsonDateTime(dateTime.toInstant().toEpochMilli()))
+        retryMongoOperation("update cache validation time") {
+            webCache.updateOne(
+                Document("url", url),
+                BsonDocument(
+                    $$"$set",
+                    BsonDocument("lastChecked", BsonDateTime(dateTime.toInstant().toEpochMilli()))
+                )
             )
-        )
+        }
     }
 }

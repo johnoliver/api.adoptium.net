@@ -2,11 +2,28 @@
 
 Date: 2026-10-22
 
-Last reviewed: 2026-10-23
+Last reviewed: 2026-10-30
 
 ## Status
 
 Accepted
+
+## Review entry point
+
+The objective of [adoptium/api.adoptium.net#2191](https://github.com/adoptium/api.adoptium.net/pull/2191)
+is reliable active-EA refresh and complete upstream-release replacement, using
+the existing updater and publication lifecycle. It is not a general recovery
+framework. Review against the invariants below and the explicitly accepted
+scope, rather than treating every imaginable recovery scenario as a requirement.
+The invariants remain obligations to verify, not grounds to dismiss a defect in
+a supported scenario.
+
+[Path-scoped Copilot review instructions](../../.github/instructions/release-updates.instructions.md)
+repeat the essential contracts and limitations directly in an instruction file;
+the longer explanation here is not the only source of review context.
+The [upstream comparison](#behaviour-comparison-with-upstreammain) records the
+reviewed baseline, and [regression ownership](#regression-ownership) identifies
+the suites exercising the boundaries.
 
 ## Context
 
@@ -17,8 +34,8 @@ Refreshing only matching split IDs can leave obsolete splits behind, while
 accepting partially mapped assets can publish an incomplete EA.
 
 The update mechanism must balance freshness, completeness, GitHub request volume
-and implementation complexity. A single failing EA must not prevent unrelated
-releases from updating.
+and implementation complexity. In normal operation, a single failing EA must not
+prevent unrelated releases from updating, subject to the scope below.
 
 This decision documents the current release update mechanism. It does not
 introduce the per-release database persistence or communications channel proposed
@@ -32,6 +49,7 @@ not guarantees about every possible upstream change.
 | Assumption | Consequence or limitation |
 | --- | --- |
 | Historical EAs are not expected to be modified. | Poll the latest EA and recently published EAs rather than repeatedly fetching the full EA history. An observed timestamp or asset-count change can still select an older EA, but special recovery for historical edits is outside scope. |
+| Forced legacy AdoptOpenJDK rebuilding (`UPDATE_ADOPTOPENJDK=true`) is exceptional and not expected in normal operation. | Per-EA failure isolation is not guaranteed during forced legacy rebuilds. Accept that a failed date-classified legacy EA can abort the build rather than introducing a shared classifier solely for this case. |
 | An established feature version is not expected to disappear or lose all its published releases. | Removing an entire feature version, including when full-build EA omissions leave it empty, is outside scope. Do not add MongoDB cleanup for absent or explicitly empty feature versions solely to support this case. |
 | All relevant metadata will not disappear from a previously metadata-based release. | Do not persist historical metadata presence to distinguish this case from a genuinely metadata-free legacy release. Individual missing or invalid required sidecars remain supported failure scenarios. |
 | Genuinely metadata-free legacy releases remain valid inputs. | Preserve release-name and filename fallback, including for legacy Semeru releases; absence of all metadata is not by itself a failure. |
@@ -69,8 +87,33 @@ The failure outcomes below are explicit policy choices, not assumptions that
 failures cannot occur: prefer a stale complete EA on incremental failure, omit
 a failed EA during a full rebuild, and reject incomplete binary snapshots except
 for the explicit per-artifact checksum exclusions described below.
-GA failures and repository-wide listing failures still abort a full-build attempt;
+Retryable GA mapping failures, mapping exceptions and repository-wide listing
+failures still abort a full-build attempt;
 EA failure isolation does not relax those boundaries.
+MongoDB operations throughout persistence, including the metadata cache, share a
+bounded retry policy for reads and repeat-safe writes: at most three
+application-level attempts, with cancellable delays of 100 ms and 200 ms.
+Only known transient connection, server-selection, primary/recovery failures or
+errors labelled `RetryableWriteError` qualify. Permanent or unclassified errors
+and coroutine cancellation propagate immediately. Failed read cursors restart
+with a fresh result rather than retaining partially collected rows.
+
+Append-only inserts, including release/CDXA batches, statistics and release
+notes, are not replayed by this policy: an acknowledgement failure can mean the
+write already succeeded. Nor are complete publications or delete/insert
+sequences retried. Existing MongoDB driver retry defaults remain unchanged;
+three application attempts are not a limit on wire commands or elapsed time.
+
+A permanent failure or exhausted operation budget abandons the entire current
+update attempt rather than being isolated to one release or retried at a higher
+layer. The scheduler logs the failure and remains active for the next scheduled
+cycle. Already completed database writes are not rolled back;
+incomplete-publication markers and reader checks remain necessary.
+Generation markers detect incomplete publication; they are not backups. A later
+full rebuild uses surviving records and the normal retrieval filters, so it
+cannot guarantee restoration of records already deleted outside those filters,
+such as excluded legacy releases. That remains an operational data-recovery
+limitation of the chosen non-transactional, abandon-on-failure policy.
 
 Version-parsing failures are non-retryable within an update window but are not
 remembered by the mapper. This differs from `upstream/main`, where these mapping
@@ -88,13 +131,14 @@ do not expand that scope to make a regression pass.
 
 | ID | Invariant | Owning boundary and required scenario |
 | --- | --- | --- |
-| I1 | Updater baselines include persisted releases and download attribution independently of API visibility filters or serving-version caps. | Updater snapshot loading: include a zero-binary release and a version above the frontend cap. |
+| I1 | Updater baselines include persisted releases and download attribution independently of API visibility filters or serving-version caps. | Updater snapshot loading: include a zero-binary release and a version above the frontend cap; exercise real MongoDB reads as well as an in-memory double. |
 | I2 | A replacement cannot silently discard newer published work within a feature version it replaces. | Build-to-publication handoff: publish an incremental change after the full-build baseline is captured, then attempt the stale full publication. |
-| I3 | Partial publication is never accepted as a committed generation. Recovery read failure cannot become an empty successful baseline. | Mongo publication and snapshot loading: fail invalidation, release writes, final publication, or recovery reads; repeat after restart. |
+| I3 | A partial release-catalogue publication is never accepted as a committed generation. Recovery read failure cannot become an empty successful baseline. | Mongo publication and snapshot loading: fail invalidation, release writes, final publication, or recovery reads; repeat after restart. |
 | I4 | One upstream release is replaced as a complete set of splits, never a mixture of refreshed and stale binaries. Failures follow the update-mode policies below. | Mapping and builders: fail one required sidecar in a multi-binary release under both full and incremental updates, retaining explicit per-artifact checksum exclusions. |
 | I5 | Non-empty feature replacements remove obsolete releases; missing or empty features preserve stored records. Download-loss guards account for stored and rebuilt versions, including versions absent from the candidate. | Mongo persistence and the full-update guard: exercise absent, explicitly empty, and partially populated feature versions separately and assert download totals explicitly. |
 | I6 | Asset-list ordering cannot hide an available, unambiguous sidecar or change checksum decisions. | Sidecar selection: permute exact matches, ambiguous aliases and valid more-specific aliases. |
 | I7 | Per-key cache-write ordering survives cancellation, without mixing asset identities or turning pending-fetch sharing into indefinite URL-only caching. | Cache client and persistence: cancel during a blocked database write, then fetch newer content; also exercise identity changes and later URL-only requests. |
+| I8 | Only individual repeat-safe Mongo operations receive bounded transient retries. Permanent or exhausted failures abort the scheduled attempt without cancelling future attempts or becoming per-release/optional-artifact fallbacks. | Mongo operation, mapper and scheduler boundaries: verify three application attempts, cancellation, unsafe-insert exclusions, propagation through shared cache fetches, and a later scheduled attempt. |
 
 Use real MongoDB coverage for persistence semantics rather than inferring them
 from an in-memory replacement double. For I5, retaining records for absent or
@@ -174,6 +218,7 @@ retried every cycle. The latest EA normally remains eligible for the next cycle.
 | Upstream ID absent from a complete repository summary | Remove its stored splits. |
 | Release fetch returns `null` | Retain the previous snapshot and remain eligible for selection. |
 | Release fetch or mapping throws an ordinary exception | Log the failure, retain the previous snapshot, and continue with other releases. |
+| MongoDB read or write fails, including a metadata-cache operation | Apply bounded transient retries only to the individual read or repeat-safe write. On a permanent failure or exhausted budget, abandon the entire update attempt without continuing to other releases or retrying at a higher layer. Try again on the next scheduled cycle. |
 | Required metadata is missing, unreadable, invalid, or fails retrieval | Reject that upstream snapshot as retryable; retain all its previous splits. |
 | A selected supported binary fails mapping, other than an explicit checksum disagreement | Reject that upstream snapshot as retryable; do not publish the remaining binaries. |
 | GitHub's binary SHA-256 disagrees with metadata or a checksum sidecar | Log an error and omit only that binary; publish the other successfully mapped binaries. |
@@ -268,6 +313,16 @@ The persisted omission behaviour below assumes the feature version retains at
 least one release; whole-feature-version disappearance is outside scope as
 described under [Assumptions and scope](#assumptions-and-scope).
 
+With the default `UPDATE_ADOPTOPENJDK=false`, full builds skip legacy
+AdoptOpenJDK repositories and preserve their persisted releases. Forced legacy
+rebuilds are an accepted exception to per-EA failure isolation: the legacy mapper
+can classify a dated release as an EA even when GitHub's `isPrerelease` is false,
+whereas the full-build mapping and asset-pagination failure boundaries use that
+flag. A metadata or asset-pagination failure for such a release can therefore
+abort the full build. Historical EAs are not expected to change, but this does not
+guarantee that their metadata remains readable. Do not add shared classification
+or legacy-specific recovery solely to eliminate this exceptional failure case.
+
 - For an upstream GitHub prerelease (EA), a retryable mapping failure or ordinary
   mapping exception omits the entire EA and continues rebuilding other releases.
   Its previously published splits are not carried forward. A failed new EA also
@@ -281,6 +336,12 @@ described under [Assumptions and scope](#assumptions-and-scope).
   there is no trustworthy complete list on which to base replacement and
   deletion. These are not failures of an individually identified EA.
 - Coroutine cancellation propagates through the per-release failure boundaries.
+- MongoDB failures propagate past per-release isolation once the individual
+  operation's retry budget is exhausted, or immediately when retry is unsafe or
+  the failure is permanent. They stop the remaining phases of the scheduled
+  update; append-only statistics writes are not replayed. Later scheduled
+  attempts use the normal baseline-read and full-build paths; incremental
+  publication still defers while the generation is incomplete.
 - Non-retryable mapping results are omitted, as are releases rejected by policy.
 - A successful EA refresh replaces every previous split; a successful empty
   result removes them. Failed EAs and policy exclusions are both absent from the
@@ -321,6 +382,19 @@ the unfiltered persisted snapshot. API-only filtering must not feed publication:
 in particular, internal releases with no binaries retain their download counts
 even though the frontend hides them. Normal updater snapshot reads still reject
 incomplete generations; only recovery baseline reads permit them.
+Deferring incremental publication does not schedule an immediate full rebuild:
+the existing daily full-update schedule remains the retry opportunity.
+
+Each full build captures one complete persisted baseline with its generation,
+instead of reusing the scheduler's startup catalogue. The preservation filter
+and statistics guard both use that same baseline. The existing publication
+mutex checks that the generation is unchanged before writing; if an incremental
+publication changed it during the build, discard the stale candidate and reload
+the current committed snapshot. This does not add another publication lock or
+retry queue. Updater reads enumerate the persisted release collection rather
+than applying the frontend's version range.
+This is the existing single-updater, in-process publication mutex, not a
+distributed compare-and-swap or a transaction across independent writers.
 
 Do not pass prior EA splits through the full mapping path, or add partial
 full-build persistence, per-binary fallback or a separate recovery framework.
@@ -345,8 +419,10 @@ available checksum sidecar for this comparison even when GitHub or metadata
 already provides a checksum. Compare hexadecimal values case-insensitively;
 checksum sidecars may contain a bare hash or a hash followed by a filename.
 Prefer the exact `<asset-name>.sha256.txt` sidecar before legacy basename
-aliases, independently of asset order. Legacy aliases remain supported when no
-exact sidecar exists. Cancellation during sidecar retrieval propagates through
+aliases, independently of asset order. Among aliases, prefer the full basename
+with known extensions removed before the shorter first-dot basename. Skip each
+ambiguous alias and continue considering the others. Legacy aliases remain
+supported when no exact sidecar exists. Cancellation during sidecar retrieval propagates through
 the asset-cache and checksum-mapping boundaries; it is not treated as an
 unavailable optional checksum.
 
@@ -354,9 +430,11 @@ A legacy basename sidecar shared by several supported artifacts (for example `fo
 for both `foo.zip` and `foo.msi`) is ambiguous, so it is treated as unavailable for each
 of them unless the others have their own exact sidecar. The same applies to `.json` metadata.
 Cache writes are ordered per cache key, GitHub download totals are summed as `Long`,
-the GitHub stats save is retried once (the full-update guard uses the persisted release snapshot), empty
-probed feature versions are omitted from incremental results, and incremental selection
-does the cheap age and already-selected checks before the per-release metadata lookup.
+and append-only GitHub statistics saves are not replayed after a database error.
+The full-update guard uses the persisted release snapshot, not saved statistics.
+Empty probed feature versions are omitted from incremental results, and
+incremental selection does the cheap age and already-selected checks before the
+per-release metadata lookup.
 
 If either value disagrees with GitHub, log an error identifying the asset and
 the conflicting checksums, and exclude only that binary. For an installer
@@ -387,9 +465,24 @@ that the hash written inside it agrees with GitHub's digest for the binary.
 Cache retention is thirty days since demand access, enforced asynchronously by
 MongoDB's TTL index on `lastAccessed`, not by an application eviction loop.
 Background HTTP validation does not extend demand retention; old entries without
-usage history receive one retention-period grace. Cache writes remain
-asynchronous; this decision does not introduce a durable-cache-write prerequisite
-for publishing a release.
+usage history receive one retention-period grace. Cache persistence uses
+asynchronous jobs whose completion is awaited under the per-key lock. Cancelling
+a fetch during that wait does not release the lock until its write finishes;
+cancellation then propagates. HTTP retrieval remains cancellable. Cache reads,
+demand touches and writes use the same bounded MongoDB-operation retry policy.
+A permanently failed or exhausted cache write propagates to all callers sharing
+that fetch and abandons the current update attempt, even if the HTTP content was
+fetched successfully. Cache writes return awaitable results rather than
+completion-only jobs, so database errors cannot be silently discarded. Propagated
+database errors bypass HTTP retries and optional sidecar fallbacks. A failed
+background refresh is logged without terminating the refresh worker; later
+requests can try again.
+
+A waiter also performs its own demand-touch read after shared success. That read
+can fail after the owner has returned successfully; under the strict database
+policy the waiter propagates the failure and the update is abandoned. Shared
+HTTP work is not a promise that every caller's later bookkeeping has the same
+outcome.
 
 Overlapping identical fetches share pending work, including retries, but completed
 requests are removed rather than becoming an additional indefinite cache.
@@ -436,16 +529,15 @@ release edit, asset-count change or a full update's filters.
 
 ## Behaviour comparison with upstream/main
 
-Re-evaluated on 2026-10-23 against the local `upstream/main` reference at commit
-`d9836348`. The compared branch includes that commit via merge commit `32afbfd2`,
-plus subsequent checksum-lookup, cancellation and cache API cleanup changes. This
-replaces the earlier comparison against `77a4d8b0`; it is a fixed-baseline
-comparison, not a claim about later changes to either branch. The later upstream
-commit `9c865f39` changes only the CodeQL workflow, so this comparison still holds.
+Re-evaluated on 2026-10-30 against freshly fetched `upstream/main` at commit
+`8a1357d894b9e84bfa54e38fdd31f66d73f87153`, including the current local working-tree
+changes and invariant regression tests. This replaces the earlier comparisons
+against `77a4d8b0` and `d9836348`. It is a fixed-baseline comparison, not a claim
+that these local changes are already present in the remote PR.
 
-| Area | Upstream at `d9836348` | Current code |
+| Area | Upstream at `8a1357d8` | Current code |
 | --- | --- | --- |
-| EA failure during a full update | An EA mapping/required-metadata failure or asset-pagination exception aborts that full-build attempt. | Log and omit the entire failed EA, including previous splits, while rebuilding other releases. GA failures still abort. |
+| EA failure during a full update | An EA mapping/required-metadata failure or asset-pagination exception aborts that full-build attempt. | Log and omit the entire failed EA, including previous splits, while rebuilding other releases. GA failures still abort. Forced legacy rebuilds retain the exception described above. |
 | Full-update download-count guard | Reject a feature-version download-total decrease against the last saved statistic, without allowing for omitted EAs. | Compare against the persisted unfiltered snapshot total, allowing the download counts of persisted EAs now absent from the rebuild. Retained-EA and GA losses receive no allowance. |
 | Latest EA polling | An unchanged EA outside the seven-day refresh window is not necessarily fetched. | Select the latest known EA per vendor, repository and feature version even when its timestamp and asset count are unchanged. Existing upload-grace and exclusion rules still apply. |
 | Feature-version discovery | Incremental updates visit only versions in the stored catalogue. | Visit the union of stored and supported versions, allowing an EA-only version omitted by a full rebuild to recover incrementally. |
@@ -455,7 +547,11 @@ commit `9c865f39` changes only the CodeQL workflow, so this comparison still hol
 | Metadata/checksum cache freshness | Use URL-based caching. Replacing an asset at the same URL can reuse cached content until validation refreshes it. | Key asset reads by URL plus GitHub asset ID/digest. Identity changes cause misses; assets without either identity field are fetched on demand. |
 | Checksums | Use metadata SHA-256, then checksum sidecars. | Compare a valid GitHub SHA-256 with available metadata/sidecar checksums and exclude only the affected artifact on disagreement. Otherwise prefer GitHub, then the existing fallbacks. Downloaded sidecars with supplied digests are validated before use/caching. |
 | Installer metadata | Do not load installer metadata for validation; use its checksum sidecar for the installer checksum. | Load matching installer metadata through the asset-aware cache and include its SHA-256 in agreement checks. Missing metadata assets are allowed; listed metadata that cannot be read or parsed excludes only the installer, not its archive. |
-| Cache writes | Wait for the cache write before returning fetched content. | Write asynchronously; release publication does not wait for cache persistence. |
+| Cache writes | Wait for completion-only jobs; their asynchronous write failure does not propagate through `join()`. | Await the result under a per-key lock, retaining ordering through cancellation. Permanent or exhausted cache-write failure fails the shared fetch and aborts the update. |
+| Updater baseline | Use the API's filtered, serving-version-limited projection for startup and checksum reconciliation. Full builds preserve from the supplied in-memory catalogue. | Read the entire persisted catalogue, including zero-binary accounting records. Each full build captures its own baseline and generation for both preservation and statistics. |
+| Publication and readers | Write the target generation in `finally`, even after failed release writes. Reader loads do not reject an incomplete or changing generation. | Invalidate before release writes, commit only after success, and reject incomplete/changing reader snapshots. Discard a full candidate when its baseline generation changed during the build. |
+| Database failures | Several release/optional-artifact boundaries can log and downgrade database failures. Failed full updates can continue into subsequent phases. | Retry known transient failures only at individual safe Mongo-operation boundaries, then propagate to the scheduler and stop the current attempt. Keep later scheduled attempts alive. |
+| Attestation generation | Advance the generation in `finally`, even after failed attestation writes. | Advance only after successful writes; do not replay ambiguous inserts. This does not add the release catalogue's incomplete-generation protocol to CDXA. |
 | Known tag exclusions | Reject `jdk-11.0.13'+8` and `jdk17u-2022-05-27-19-32-beta` before mapping, including GA releases. | Filter successfully mapped EA results only. An empty filtered result removes old incremental splits; GA releases are not excluded by these rules. |
 
 The merged upstream baseline already implements the following protections; they
@@ -473,8 +569,10 @@ remain shared behaviour, not differences introduced by this work:
 - Stable attribution of installer and other eligible ungrouped downloads to
   the lowest-version split exactly once, independent of asset order.
 
-Scheduling, the database-checksum publication guard and full-update age/vendor
-filters are also unchanged. The accepted limitations under
+The daily/six-minute scheduling cadence and full-update age/vendor filters are
+unchanged. Publication generation checks and scheduled database-failure handling
+are strengthened as described above; they are not unchanged upstream behaviour.
+The accepted limitations under
 [Assumptions and scope](#assumptions-and-scope) still apply; the merge does not add
 historical-EA recovery or whole-feature-version database cleanup.
 
@@ -523,3 +621,25 @@ are separate implementation changes, not additional failure-policy decisions.
 - [Repository mapping and shared exclusions](../../adoptium-updater-parent/adoptium-api-v3-updater/src/main/kotlin/net/adoptium/api/v3/AdoptRepository.kt)
 - [Metadata grouping and binary completeness](../../adoptium-updater-parent/adoptium-mappers-parent/adopt-mappers/src/main/kotlin/net/adoptium/api/v3/mapping/adopt/AdoptReleaseMapper.kt)
 - [Scheduling and publication](../../adoptium-updater-parent/adoptium-api-v3-updater/src/main/kotlin/net/adoptium/api/v3/V3Updater.kt)
+- [Unfiltered baseline and reader generation checks](../../adoptium-api-v3-persistence/src/main/kotlin/net/adoptium/api/v3/dataSources/APIDataStoreImpl.kt)
+- [Mongo publication](../../adoptium-api-v3-persistence/src/main/kotlin/net/adoptium/api/v3/dataSources/persitence/mongo/MongoApiPersistence.kt)
+- [Bounded safe-operation retries](../../adoptium-api-v3-persistence/src/main/kotlin/net/adoptium/api/v3/dataSources/persitence/mongo/MongoInterface.kt)
+- [Cache ordering, sharing and failure propagation](../../adoptium-updater-parent/adoptium-datasources-parent/adoptium-github-datasource/src/main/kotlin/net/adoptium/api/v3/dataSources/github/CachedGitHubHtmlClient.kt)
+
+## Regression ownership
+
+The following suites live under
+[`adoptium-api-v3-updater/src/test/kotlin/net/adoptium/api`](../../adoptium-updater-parent/adoptium-api-v3-updater/src/test/kotlin/net/adoptium/api).
+They identify where to add a boundary regression; passing suites are evidence,
+not proof that every interleaving or failure is covered.
+
+| Invariant | Principal regression suites |
+| --- | --- |
+| I1 | `MongoAPIPersistenceTests`, `UpdaterSnapshotTest`, `AdoptReleaseMapperTest` |
+| I2 | `PublicationInvariantTest` |
+| I3 | `MongoAPIPersistenceTests`, `ReleaseGenerationReadTest`, `DatabaseFailurePolicyTest` |
+| I4 | `AdoptReposBuilderSplitReleaseTest`, `AdoptReleaseMapperTest`, `GraphQLGitHubReleaseClientTest` |
+| I5 | `MongoAPIPersistenceTests`, `PublicationInvariantTest`, `AdoptReleaseMapperTest` |
+| I6 | `GitHubAssetCacheRefreshTest`, `AdoptReleaseMapperTest` |
+| I7 | `CachedGitHubHtmlClientTest`, `GitHubAssetCacheRefreshTest`, `InternalDbStoreTests` |
+| I8 | `MongoRetryTest`, `DatabaseFailurePolicyTest`, `CachedGitHubHtmlClientTest`, `v3/stats/StatsInterfaceTest` |

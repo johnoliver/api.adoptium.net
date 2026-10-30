@@ -1,5 +1,6 @@
 package net.adoptium.api.v3.dataSources.github
 
+import com.mongodb.MongoException
 import jakarta.enterprise.context.ApplicationScoped
 import jakarta.inject.Inject
 import kotlinx.coroutines.CancellationException
@@ -8,9 +9,13 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ExecutorCoroutineDispatcher
 import kotlinx.coroutines.GlobalScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import net.adoptium.api.v3.TimeSource
@@ -118,6 +123,8 @@ open class CachedGitHubHtmlClient @Inject constructor(
                 LOGGER.debug("Enqueuing ${request.url} ${request.lastModified} ${workList.size}")
                 try {
                     get(request, accessedAt = null)
+                } catch (e: MongoException) {
+                    LOGGER.error("Abandoning background refresh after database failure for ${request.url}", e)
                 } finally {
                     queuedRefreshes.remove(request)
                 }
@@ -155,6 +162,8 @@ open class CachedGitHubHtmlClient @Inject constructor(
                     cached ?: fetchAndStore(request, cacheKey, digest, accessedAt)
                 }
             } catch (e: CancellationException) {
+                throw e
+            } catch (e: MongoException) {
                 throw e
             } catch (e: Exception) {
                 LOGGER.error("Failed to read data retrying $retryCount ${request.url}", e)
@@ -198,7 +207,11 @@ open class CachedGitHubHtmlClient @Inject constructor(
 
         val lastModified = response?.getFirstHeader("Last-Modified")?.value
 
-        internalDbStore.putCachedWebpage(cacheKey, lastModified, TimeSource.now(), body, accessedAt).join()
+        currentCoroutineContext().ensureActive()
+        withContext(NonCancellable) {
+            internalDbStore.putCachedWebpage(cacheKey, lastModified, TimeSource.now(), body, accessedAt).await()
+        }
+        currentCoroutineContext().ensureActive()
         LOGGER.debug("Got ${request.url}")
         return body
     }

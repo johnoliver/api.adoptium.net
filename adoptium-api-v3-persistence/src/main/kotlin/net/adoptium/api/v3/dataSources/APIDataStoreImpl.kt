@@ -43,13 +43,11 @@ open class APIDataStoreImpl : APIDataStore {
             forceUpdate: Boolean,
             previousRepo: AdoptRepos?,
             versions: List<Int>,
-            logEntries: Boolean = true,
-            allowIncomplete: Boolean = false,
-            filterForApi: Boolean = true): Pair<AdoptRepos, UpdatedInfo> {
+            logEntries: Boolean = true): Pair<AdoptRepos, UpdatedInfo> {
 
             return runBlocking {
                 val updated = dataStore.getUpdatedAt()
-                check(allowIncomplete || !updated.isIncomplete()) { "Release publication is incomplete: $updated" }
+                check(!updated.isIncomplete()) { "Release publication is incomplete: $updated" }
 
                 if (previousRepo == null || forceUpdate || updated != previousUpdateInfo) {
                     val data = versions
@@ -61,7 +59,7 @@ open class APIDataStoreImpl : APIDataStore {
                     val updatedAt = dataStore.getUpdatedAt()
                     check(updated == updatedAt) { "Release generation changed while loading: $updated -> $updatedAt" }
 
-                    val newData = if (filterForApi) filterValidAssets(data) else AdoptRepos(data)
+                    val newData = filterValidAssets(data)
 
                     if (logEntries) {
                         LOGGER.info("Loaded Version: $updatedAt")
@@ -75,18 +73,17 @@ open class APIDataStoreImpl : APIDataStore {
         }
 
         // Updater checksums and publication must use the persisted catalogue, not the API projection.
-        fun loadUpdaterSnapshot(dataStore: ApiPersistence, allowIncomplete: Boolean = false): AdoptRepos {
-            return loadDataFromDb(
-                dataStore,
-                UpdatedInfo(ZonedDateTime.now().minusYears(10), "111", 0),
-                true,
-                null,
-                (8..MAX_VERSION_TO_LOAD).toList(),
-                logEntries = false,
-                allowIncomplete = allowIncomplete,
-                filterForApi = false
-            ).first
+        fun loadUpdaterSnapshotWithInfo(dataStore: ApiPersistence, allowIncomplete: Boolean = false): Pair<AdoptRepos, UpdatedInfo> = runBlocking {
+            val before = dataStore.getUpdatedAt()
+            check(allowIncomplete || !before.isIncomplete()) { "Release publication is incomplete: $before" }
+            val snapshot = dataStore.readAllReleaseData()
+            val after = dataStore.getUpdatedAt()
+            check(before == after) { "Release generation changed while loading: $before -> $after" }
+            Pair(snapshot, after)
         }
+
+        fun loadUpdaterSnapshot(dataStore: ApiPersistence, allowIncomplete: Boolean = false): AdoptRepos =
+            loadUpdaterSnapshotWithInfo(dataStore, allowIncomplete).first
 
         // Recovery may use surviving records, but they must never enter the frontend cache.
         fun loadRecoveryBaseline(dataStore: ApiPersistence): AdoptRepos =

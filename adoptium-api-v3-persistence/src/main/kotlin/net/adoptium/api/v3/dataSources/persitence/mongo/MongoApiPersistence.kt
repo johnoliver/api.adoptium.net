@@ -5,6 +5,7 @@ import com.mongodb.client.model.ReplaceOptions
 import com.mongodb.kotlin.client.coroutine.MongoCollection
 import jakarta.enterprise.context.ApplicationScoped
 import jakarta.inject.Inject
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.flow.toList
@@ -50,10 +51,15 @@ open class MongoApiPersistence @Inject constructor(mongoClient: MongoClient) : M
             // Create indexes for packageStats if they don't exist
             try {
                 runBlocking {
-                    collection.createIndex(Document("date", 1))
-                    collection.createIndex(Document("feature_version", 1).append("date", 1))
+                    retryMongoOperation("create package statistics date index") {
+                        collection.createIndex(Document("date", 1))
+                    }
+                    retryMongoOperation("create package statistics version index") {
+                        collection.createIndex(Document("feature_version", 1).append("date", 1))
+                    }
                 }
             } catch (e: Exception) {
+                if (e is CancellationException) throw e
                 LOGGER.warn("Failed to create indexes for packageStats: ${e.message}")
             }
         })
@@ -92,32 +98,30 @@ open class MongoApiPersistence @Inject constructor(mongoClient: MongoClient) : M
     }
 
     override suspend fun updateCdxaRepos(repo: AdoptCdxaRepos, checksum: String) {
-
-        try {
-            val featureVersions = repo.repos.map { it.featureVersion }.toSet()
-
-            featureVersions.forEach { featureVersion ->
-                writeCdxas(featureVersion, repo.repos.filter { it.featureVersion == featureVersion })
-            }
-
-            removeCdxasNotInFeatureVersions(featureVersions)
-        } finally {
-            updateCdxaUpdatedTime(TimeSource.now(), checksum, repo.hashCode(), repo.lastModified)
+        val featureVersions = repo.repos.map { it.featureVersion }.toSet()
+        featureVersions.forEach { featureVersion ->
+            writeCdxas(featureVersion, repo.repos.filter { it.featureVersion == featureVersion })
         }
+        removeCdxasNotInFeatureVersions(featureVersions)
+        updateCdxaUpdatedTime(TimeSource.now(), checksum, repo.hashCode(), repo.lastModified)
     }
 
     private suspend fun writeReleases(featureVersion: Int, value: FeatureRelease) {
         val toAdd = value.releases.getReleases().toList()
         // Empty features are not whole-version deletion requests; see ADR 8.
         if (toAdd.isNotEmpty()) {
-            releasesCollection.deleteMany(majorVersionMatcher(featureVersion))
+            retryMongoOperation("delete releases for feature $featureVersion") {
+                releasesCollection.deleteMany(majorVersionMatcher(featureVersion))
+            }
             releasesCollection.insertMany(toAdd, InsertManyOptions())
         }
     }
 
     private suspend fun writeCdxas(featureVersion: Int, cdxas: List<Cdxa>) {
         // First delete all existing for featureVersion
-        cdxasCollection.deleteMany(cdxaFeatureVersionMatcher(featureVersion))
+        retryMongoOperation("delete attestations for feature $featureVersion") {
+            cdxasCollection.deleteMany(cdxaFeatureVersionMatcher(featureVersion))
+        }
         if (cdxas.isNotEmpty()) {
             // Then add updated featureVersionCdxas...
             cdxasCollection.insertMany(cdxas, InsertManyOptions())
@@ -126,28 +130,40 @@ open class MongoApiPersistence @Inject constructor(mongoClient: MongoClient) : M
 
     private suspend fun removeCdxasNotInFeatureVersions(featureVersions: Set<Int>) {
         // Get existing featureVersions in DB
-        val dbFeatureVersions = cdxasCollection.distinct<Int>("featureVersion").toList()
+        val dbFeatureVersions = retryMongoOperation("read attestation feature versions") {
+            cdxasCollection.distinct<Int>("featureVersion").toList()
+        }
 
         // Delete feature versions that no longer exist
         val toDelete = dbFeatureVersions.filterNot { it in featureVersions }
         toDelete.forEach { featureVersionToDelete ->
             // Delete all existing for featureVersionToDelete
-            cdxasCollection.deleteMany(cdxaFeatureVersionMatcher(featureVersionToDelete))
+            retryMongoOperation("delete attestations for feature $featureVersionToDelete") {
+                cdxasCollection.deleteMany(cdxaFeatureVersionMatcher(featureVersionToDelete))
+            }
         }
     }
 
     override suspend fun readReleaseData(featureVersion: Int): FeatureRelease {
-        val releases = releasesCollection
-            .find(majorVersionMatcher(featureVersion))
-            .toList()
+        val releases = retryMongoOperation("read releases for feature $featureVersion") {
+            releasesCollection.find(majorVersionMatcher(featureVersion)).toList()
+        }
 
         return FeatureRelease(featureVersion, Releases(releases))
     }
 
+    override suspend fun readAllReleaseData(): AdoptRepos {
+        val releases = retryMongoOperation("read all releases") { releasesCollection.find().toList() }
+        return AdoptRepos(releases
+            .groupBy { it.version_data.major }
+            .toSortedMap()
+            .map { (version, releases) -> FeatureRelease(version, Releases(releases)) })
+    }
+
     override suspend fun readCdxaData(): List<Cdxa> {
-        return cdxasCollection
-            .find(Document())
-            .toList()
+        return retryMongoOperation("read attestations") {
+            cdxasCollection.find(Document()).toList()
+        }
     }
 
     override suspend fun addGithubDownloadStatsEntries(stats: List<GitHubDownloadStatsDbEntry>) {
@@ -155,30 +171,31 @@ open class MongoApiPersistence @Inject constructor(mongoClient: MongoClient) : M
     }
 
     override suspend fun getStatsForFeatureVersion(featureVersion: Int): List<GitHubDownloadStatsDbEntry> {
-        return gitHubStatsCollection.find(Document("version.major", featureVersion))
-            .toList()
+        return retryMongoOperation("read GitHub statistics for feature $featureVersion") {
+            gitHubStatsCollection.find(Document("version.major", featureVersion)).toList()
+        }
     }
 
     override suspend fun getLatestGithubStatsForFeatureVersion(featureVersion: Int): GitHubDownloadStatsDbEntry? {
-        return gitHubStatsCollection
-            .find(Document("feature_version", featureVersion))
-            .sort(Document("date", -1))
-            .limit(1)
-            .firstOrNull()
+        return retryMongoOperation("read latest GitHub statistics for feature $featureVersion") {
+            gitHubStatsCollection
+                .find(Document("feature_version", featureVersion))
+                .sort(Document("date", -1))
+                .limit(1)
+                .firstOrNull()
+        }
     }
 
     override suspend fun getGithubStats(start: ZonedDateTime, end: ZonedDateTime): List<GitHubDownloadStatsDbEntry> {
-        return gitHubStatsCollection
-            .find(betweenDates(start, end))
-            .sort(Document("date", 1))
-            .toList()
+        return retryMongoOperation("read GitHub statistics") {
+            gitHubStatsCollection.find(betweenDates(start, end)).sort(Document("date", 1)).toList()
+        }
     }
 
     override suspend fun getDockerStats(start: ZonedDateTime, end: ZonedDateTime): List<DockerDownloadStatsDbEntry> {
-        return dockerStatsCollection
-            .find(betweenDates(start, end))
-            .sort(Document("date", 1))
-            .toList()
+        return retryMongoOperation("read Docker statistics") {
+            dockerStatsCollection.find(betweenDates(start, end)).sort(Document("date", 1)).toList()
+        }
     }
 
     override suspend fun addDockerDownloadStatsEntries(stats: List<DockerDownloadStatsDbEntry>) {
@@ -187,15 +204,15 @@ open class MongoApiPersistence @Inject constructor(mongoClient: MongoClient) : M
 
     override suspend fun getLatestAllDockerStats(): List<DockerDownloadStatsDbEntry> {
 
-        val repoNames = dockerStatsCollection.distinct<String>("repo").toList()
+        val repoNames = retryMongoOperation("read Docker statistics repositories") {
+            dockerStatsCollection.distinct<String>("repo").toList()
+        }
 
         return repoNames
             .map {
-                dockerStatsCollection
-                    .find(Document("repo", it))
-                    .sort(Document("date", -1))
-                    .limit(1)
-                    .first()
+                retryMongoOperation("read latest Docker statistics") {
+                    dockerStatsCollection.find(Document("repo", it)).sort(Document("date", -1)).limit(1).first()
+                }
             }
             .toList()
     }
@@ -229,76 +246,80 @@ open class MongoApiPersistence @Inject constructor(mongoClient: MongoClient) : M
             )
         )
 
-        return packageStatsCollection.aggregate(pipeline)
-            .toList()
+        return retryMongoOperation("read aggregated package statistics") {
+            packageStatsCollection.aggregate(pipeline).toList()
+        }
 
     }
 
     override suspend fun getLatestPackageStatsForFeatureVersion(featureVersion: Int): CloudflarePackageDownloadStatsDbEntry? {
-        return packageStatsCollection
-            .find(Document("feature_version", featureVersion))
-            .sort(Document("date", -1))
-            .limit(1)
-            .firstOrNull()
+        return retryMongoOperation("read latest package statistics for feature $featureVersion") {
+            packageStatsCollection
+                .find(Document("feature_version", featureVersion))
+                .sort(Document("date", -1))
+                .limit(1)
+                .firstOrNull()
+        }
     }
 
     override suspend fun getPackageStats(start: ZonedDateTime, end: ZonedDateTime): List<CloudflarePackageDownloadStatsDbEntry> {
-        return packageStatsCollection
-            .find(betweenDates(start, end))
-            .sort(Document("date", 1))
-            .toList()
+        return retryMongoOperation("read package statistics") {
+            packageStatsCollection.find(betweenDates(start, end)).sort(Document("date", 1)).toList()
+        }
     }
 
     override suspend fun removeStatsBetween(start: ZonedDateTime, end: ZonedDateTime) {
         val deleteQuery = betweenDates(start, end)
-        dockerStatsCollection.deleteMany(deleteQuery)
-        gitHubStatsCollection.deleteMany(deleteQuery)
-        packageStatsCollection.deleteMany(deleteQuery)
+        retryMongoOperation("delete Docker statistics") { dockerStatsCollection.deleteMany(deleteQuery) }
+        retryMongoOperation("delete GitHub statistics") { gitHubStatsCollection.deleteMany(deleteQuery) }
+        retryMongoOperation("delete package statistics") { packageStatsCollection.deleteMany(deleteQuery) }
     }
 
     override suspend fun setReleaseInfo(releaseInfo: ReleaseInfo) {
-        releaseInfoCollection.deleteMany(releaseVersionDbEntryMatcher())
-        releaseInfoCollection.replaceOne(
-            releaseVersionDbEntryMatcher(),
-            releaseInfo,
-            ReplaceOptions().upsert(true)
-        )
+        retryMongoOperation("delete release information") {
+            releaseInfoCollection.deleteMany(releaseVersionDbEntryMatcher())
+        }
+        retryMongoOperation("replace release information") {
+            releaseInfoCollection.replaceOne(releaseVersionDbEntryMatcher(), releaseInfo, ReplaceOptions().upsert(true))
+        }
     }
 
     // visible for testing
     open suspend fun updateUpdatedTime(dateTime: ZonedDateTime, checksum: String, hashCode: Int) {
-        updateTimeCollection.replaceOne(
-            Document(),
-            UpdatedInfo(dateTime, checksum, hashCode),
-            ReplaceOptions().upsert(true)
-        )
-        updateTimeCollection.deleteMany(Document("time", BsonDocument("\$lt", BsonDateTime(dateTime.toInstant().toEpochMilli()))))
+        retryMongoOperation("replace release generation") {
+            updateTimeCollection.replaceOne(Document(), UpdatedInfo(dateTime, checksum, hashCode), ReplaceOptions().upsert(true))
+        }
+        retryMongoOperation("delete obsolete release generations") {
+            updateTimeCollection.deleteMany(Document("time", BsonDocument("\$lt", BsonDateTime(dateTime.toInstant().toEpochMilli()))))
+        }
     }
 
     open suspend fun updateCdxaUpdatedTime(dateTime: ZonedDateTime, checksum: String, hashCode: Int, lastModified: Instant? = null) {
         val lastModifiedDate = lastModified?.let { java.util.Date.from(it) }
-        cdxaUpdateTimeCollection.replaceOne(
-            Document(),
-            UpdatedInfo(dateTime, checksum, hashCode, lastModifiedDate),
-            ReplaceOptions().upsert(true)
-        )
-        cdxaUpdateTimeCollection.deleteMany(Document("time", BsonDocument("\$lt", BsonDateTime(dateTime.toInstant().toEpochMilli()))))
+        retryMongoOperation("replace attestation generation") {
+            cdxaUpdateTimeCollection.replaceOne(Document(), UpdatedInfo(dateTime, checksum, hashCode, lastModifiedDate), ReplaceOptions().upsert(true))
+        }
+        retryMongoOperation("delete obsolete attestation generations") {
+            cdxaUpdateTimeCollection.deleteMany(Document("time", BsonDocument("\$lt", BsonDateTime(dateTime.toInstant().toEpochMilli()))))
+        }
     }
 
     override suspend fun getUpdatedAt(): UpdatedInfo {
-        val info = updateTimeCollection.find().firstOrNull()
+        val info = retryMongoOperation("read release generation") { updateTimeCollection.find().firstOrNull() }
         // if we have no existing time, make it 5 mins ago, should only happen on first time the db is used
         return info ?: initialUpdateInfo
     }
 
     override suspend fun getCdxaUpdatedAt(): UpdatedInfo {
-        val info = cdxaUpdateTimeCollection.find().firstOrNull()
+        val info = retryMongoOperation("read attestation generation") { cdxaUpdateTimeCollection.find().firstOrNull() }
         // if we have no existing time, make it 5 mins ago, should only happen on first time the db is used
         return info ?: UpdatedInfo(TimeSource.now().minusMinutes(5), "000", 0)
     }
 
     override suspend fun getReleaseInfo(): ReleaseInfo? {
-        return releaseInfoCollection.find(releaseVersionDbEntryMatcher()).firstOrNull()
+        return retryMongoOperation("read release information") {
+            releaseInfoCollection.find(releaseVersionDbEntryMatcher()).firstOrNull()
+        }
     }
 
     private fun releaseVersionDbEntryMatcher() = Document("tip_version", BsonDocument("\$exists", BsonBoolean(true)))
@@ -319,29 +340,33 @@ open class MongoApiPersistence @Inject constructor(mongoClient: MongoClient) : M
     private fun cdxaFeatureVersionMatcher(featureVersion: Int) = Document("featureVersion", featureVersion)
 
     override suspend fun getGhReleaseMetadata(gitHubId: GitHubId): GHReleaseMetadata? {
-        return githubReleaseMetadataCollection.find(matchGithubId(gitHubId)).firstOrNull()
+        return retryMongoOperation("read GitHub release metadata") {
+            githubReleaseMetadataCollection.find(matchGithubId(gitHubId)).firstOrNull()
+        }
     }
 
     override suspend fun setGhReleaseMetadata(ghReleaseMetadata: GHReleaseMetadata) {
-        githubReleaseMetadataCollection
-            .replaceOne(
-                matchGithubId(ghReleaseMetadata.gitHubId),
-                ghReleaseMetadata,
-                ReplaceOptions().upsert(true)
-            )
+        retryMongoOperation("replace GitHub release metadata") {
+            githubReleaseMetadataCollection.replaceOne(
+                matchGithubId(ghReleaseMetadata.gitHubId), ghReleaseMetadata, ReplaceOptions().upsert(true))
+        }
     }
 
     override suspend fun hasReleaseNotesForGithubId(gitHubId: GitHubId): Boolean {
-        return githubReleaseNotesCollection.find(Document("id", gitHubId.id)).firstOrNull() != null
+        return retryMongoOperation("check release notes") {
+            githubReleaseNotesCollection.find(Document("id", gitHubId.id)).firstOrNull() != null
+        }
     }
 
     override suspend fun putReleaseNote(releaseNotes: ReleaseNotes) {
-        githubReleaseNotesCollection.deleteMany(Document("id", releaseNotes.id))
+        retryMongoOperation("delete release notes") {
+            githubReleaseNotesCollection.deleteMany(Document("id", releaseNotes.id))
+        }
         githubReleaseNotesCollection.insertOne(releaseNotes)
     }
 
     override suspend fun getReleaseNotes(vendor: Vendor, releaseName: String): ReleaseNotes? {
-        return githubReleaseNotesCollection.find(Document(
+        val query = Document(
             "\$and",
             BsonArray(
                 listOf(
@@ -350,12 +375,15 @@ open class MongoApiPersistence @Inject constructor(mongoClient: MongoClient) : M
                 )
             )
         )
-        )
-            .firstOrNull()
+        return retryMongoOperation("read release notes") {
+            githubReleaseNotesCollection.find(query).firstOrNull()
+        }
     }
 
     override suspend fun isConnected(): Boolean {
-        return client.getDatabase().runCommand(Document("serverStatus", 1)).getDouble("uptime") >= 0
+        return retryMongoOperation("check database connection") {
+            client.getDatabase().runCommand(Document("serverStatus", 1)).getDouble("uptime") >= 0
+        }
     }
 
     private fun matchGithubId(gitHubId: GitHubId) = Document("gitHubId.id", gitHubId.id)

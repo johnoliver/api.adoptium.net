@@ -409,6 +409,31 @@ class GitHubAssetCacheRefreshTest {
     }
 
     @ParameterizedTest
+    @ValueSource(strings = ["checksum", "metadata"])
+    fun `valid most specific sidecars win independently of asset order and ambiguity`(kind: String) = runBlocking {
+        val now = TimeSource.now()
+        val hash = "a".repeat(64)
+        val stem = "OpenJDK8U-jdk_x64_windows_hotspot"
+        val archive = asset("$stem.1.zip", now, "first", "sha256:$hash")
+        val other = asset("$stem.2.zip", now, "second", "sha256:$hash")
+        val suffix = if (kind == "checksum") ".sha256.txt" else ".json"
+        val ambiguous = asset("$stem$suffix", now)
+        val specific = asset("$stem.1$suffix", now)
+        val client = mockk<GitHubHtmlClient>()
+        coEvery { client.getAsset(specific) } returns "b".repeat(64)
+        val mapper = AdoptBinaryMapper(client)
+        for (assets in listOf(listOf(archive, other, ambiguous, specific), listOf(archive, ambiguous, specific))) {
+            for (ordered in listOf(assets, assets.reversed())) {
+                val binaries = mapper.toBinaryList(listOf(archive), ordered, emptyMap())
+                if (kind == "checksum") assertTrue(binaries.isEmpty())
+                else assertEquals(specific.downloadUrl, binaries.single().`package`.metadata_link)
+            }
+        }
+        coVerify(exactly = 0) { client.getAsset(ambiguous) }
+        coVerify(exactly = if (kind == "checksum") 4 else 0) { client.getAsset(specific) }
+    }
+
+    @ParameterizedTest
     @ValueSource(strings = ["stem", "first-dot"])
     fun `legacy checksum aliases remain supported without an exact sidecar`(format: String) = runBlocking {
         val now = TimeSource.now()

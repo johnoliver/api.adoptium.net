@@ -1,5 +1,6 @@
 package net.adoptium.api.v3.stats
 
+import com.mongodb.MongoException
 import jakarta.enterprise.context.ApplicationScoped
 import jakarta.inject.Inject
 import kotlinx.coroutines.CancellationException
@@ -22,17 +23,7 @@ open class StatsInterface @Inject constructor(
     private val dockerStats = dockerStatsInterfaceFactory.get()
 
     open suspend fun update(repos: AdoptRepos) {
-        // The full-update guard reads these saved stats, so retry once to avoid a stale baseline.
-        handlingUpdateException("github") {
-            try {
-                gitHubDownloadStatsCalculator.saveStats(repos)
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                LOGGER.warn("Failed to save github stats, retrying once", e)
-                gitHubDownloadStatsCalculator.saveStats(repos)
-            }
-        }
+        handlingUpdateException("github") { gitHubDownloadStatsCalculator.saveStats(repos) }
         handlingUpdateException("docker") { dockerStats.updateDb() }
         handlingUpdateException("cloudflare") { cloudFlareStatsCalculator.updateDb() }
     }
@@ -40,6 +31,7 @@ open class StatsInterface @Inject constructor(
     private suspend fun handlingUpdateException(source: String, fn: suspend () -> Unit) = try {
         fn()
     } catch (e: Exception) {
+        if (e is MongoException || e is CancellationException) throw e
         LOGGER.error("Failed to update $source, continuing with other sources", e)
     }
 

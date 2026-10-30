@@ -137,6 +137,7 @@ class V3Updater @Inject constructor(
                     return@runBlocking after
                 }
             } catch (e: Exception) {
+                if (e is MongoException) throw e
                 LOGGER.error("Failed to perform incremental update", e)
             }
             return@runBlocking null
@@ -156,6 +157,7 @@ class V3Updater @Inject constructor(
                     return@runBlocking after
                 }
             } catch (e: Exception) {
+                if (e is MongoException) throw e
                 LOGGER.error("Failed to perform incremental cdxa update", e)
             }
             return@runBlocking null
@@ -380,9 +382,9 @@ class V3Updater @Inject constructor(
         val incrementalCdxaUpdateScheduled = AtomicBoolean(false)
 
         executor.scheduleWithFixedDelay(
-            timerTask {
+            updateTask {
                 try {
-                    runUpdate(repo, incrementalUpdateScheduled, executor)
+                    repo = runUpdate(repo, incrementalUpdateScheduled, executor)
                     runCdxaUpdate(cdxaRepo, incrementalCdxaUpdateScheduled, executor)
                 } catch (e: InvalidUpdateException) {
                     LOGGER.error("Failed to perform update", e)
@@ -398,17 +400,17 @@ class V3Updater @Inject constructor(
         executor: ScheduledExecutorService
     ): AdoptRepos {
         var repo1 = repo
-        repo1 = fullUpdate(repo1, true) ?: repo1
+        repo1 = fullUpdate(true) ?: repo1
         repo1 = incrementalUpdate(repo1) ?: repo1
         if (!incrementalUpdateScheduled.getAndSet(true)) {
             executor.scheduleWithFixedDelay(
-                timerTask {
+                updateTask {
                     repo1 = incrementalUpdate(repo1) ?: repo1
                 },
                 1, 6, TimeUnit.MINUTES
             )
         }
-        repo1 = fullUpdate(repo1, false) ?: repo1
+        repo1 = fullUpdate(false) ?: repo1
         return repo1
     }
 
@@ -422,13 +424,21 @@ class V3Updater @Inject constructor(
         repo1 = incrementalCdxaUpdate(repo1) ?: repo1
         if (!incrementalCdxaUpdateScheduled.getAndSet(true)) {
             executor.scheduleWithFixedDelay(
-                timerTask {
+                updateTask {
                     repo1 = incrementalCdxaUpdate(repo1) ?: repo1
                 },
                 1, 6, TimeUnit.MINUTES
             )
         }
         return repo1
+    }
+
+    private fun updateTask(update: () -> Unit) = timerTask {
+        try {
+            update()
+        } catch (e: MongoException) {
+            LOGGER.error("Database failure; abandoning this update until the next scheduled cycle", e)
+        }
     }
 
     private fun assertConnectedToDb() {
@@ -449,13 +459,17 @@ class V3Updater @Inject constructor(
     }
 
     @Throws(InvalidUpdateException::class)
-    private fun fullUpdate(currentRepo: AdoptRepos, releasesOnly: Boolean): AdoptRepos? {
+    private fun fullUpdate(releasesOnly: Boolean): AdoptRepos? {
         // Must catch errors or may kill the scheduler
         try {
             return runBlocking {
                 LOGGER.info("Starting Full update {}", releasesOnly)
 
                 updatableVersionSupplier.updateVersions()
+
+                val (currentRepo, generation) = mutex.withLock {
+                    APIDataStoreImpl.loadUpdaterSnapshotWithInfo(database, allowIncomplete = true)
+                }
 
                 val filterType: ReleaseFilterType = if (releasesOnly) {
                     ReleaseFilterType.RELEASES_ONLY
@@ -474,17 +488,19 @@ class V3Updater @Inject constructor(
                 val checksum = calculateChecksum(repo)
 
                 val dataInDb = mutex.withLock {
-                    runBlocking {
-                        if (!validateStats(repo)) {
-                            LOGGER.error("Stats do not look correct, not saving update")
-                            throw InvalidUpdateException("Stats are not sane")
-                        }
-
-                        database.updateAllRepos(repo, checksum)
-                        statsInterface.update(repo)
-                        database.setReleaseInfo(releaseVersionResolver.formReleaseInfo(repo))
-                        apiDataStore.loadDataFromDb(forceUpdate = true, logEntries = false)
+                    if (database.getUpdatedAt() != generation) {
+                        LOGGER.warn("Not applying full update because its persisted baseline changed during the build")
+                        return@runBlocking APIDataStoreImpl.loadUpdaterSnapshot(database)
                     }
+                    if (!validateStats(repo, currentRepo)) {
+                        LOGGER.error("Stats do not look correct, not saving update")
+                        throw InvalidUpdateException("Stats are not sane")
+                    }
+
+                    database.updateAllRepos(repo, checksum)
+                    statsInterface.update(repo)
+                    database.setReleaseInfo(releaseVersionResolver.formReleaseInfo(repo))
+                    apiDataStore.loadDataFromDb(forceUpdate = true, logEntries = false)
                 }
 
                 LOGGER.info("Updating Release Notes")
@@ -496,6 +512,7 @@ class V3Updater @Inject constructor(
                 return@runBlocking repo
             }
         } catch (e: Exception) {
+            if (e is MongoException) throw e
             LOGGER.error("Failed to perform full update", e)
         } catch (e: Throwable) {
             // Log and rethrow, may be unrecoverable error such as OutOfMemoryError
@@ -534,6 +551,7 @@ class V3Updater @Inject constructor(
                 return@runBlocking repo
             }
         } catch (e: Exception) {
+            if (e is MongoException) throw e
             LOGGER.error("Failed to perform full Cdxa update", e)
         } catch (e: Throwable) {
             // Log and rethrow, may be unrecoverable error such as OutOfMemoryError
@@ -545,33 +563,26 @@ class V3Updater @Inject constructor(
 
     class InvalidUpdateException(message: String) : Exception(message)
 
-    private suspend fun validateStats(repo: AdoptRepos): Boolean {
-        return GitHubDownloadStatsCalculator
-            .getStats(repo)
-            .filter { newEntry ->
-                val newReleases = repo.repos.getValue(newEntry.feature_version).releases
+    private fun validateStats(repo: AdoptRepos, baseline: AdoptRepos): Boolean {
+        val newStats = GitHubDownloadStatsCalculator.getStats(repo).associateBy { it.feature_version }
+        return (baseline.repos.keys + repo.repos.keys).all { version ->
+            val newReleases = repo.getFeatureRelease(version)?.releases
+            val stored = baseline.getFeatureRelease(version)?.releases?.getReleases()
+                ?.filter { it.vendor == Vendor.getDefault() }
+                ?.toList().orEmpty()
+            val baselineDownloads = stored.sumOf { it.download_count }
+            val omittedEaDownloads = stored
+                .filter { it.release_type == ReleaseType.ea && newReleases?.hasReleaseId(GitHubId(it.id)) != true }
+                .sumOf { it.download_count }
+            // Full builds may omit failed EAs without invalidating an otherwise
+            // healthy rebuild. Do not exempt losses from retained EAs or GAs.
+            val comparableDownloads = (newStats[version]?.downloads ?: 0L) + omittedEaDownloads
 
-                // The stored snapshot is what this update replaces. Saved stats are not used: a failed stats
-                // write after a published omission would leave them stale and reject healthy rebuilds.
-                // Unlike the API view the snapshot keeps releases whose binaries were all excluded.
-                val stored = database.readReleaseData(newEntry.feature_version).releases.getReleases()
-                    .filter { it.vendor == Vendor.getDefault() }
-                    .toList()
-                val storedDownloads = stored.sumOf { it.download_count }
-                val omittedEaDownloads = stored
-                    .filter { it.release_type == ReleaseType.ea && !newReleases.hasReleaseId(GitHubId(it.id)) }
-                    .sumOf { it.download_count }
-                val baselineDownloads = storedDownloads
-                // Full builds may omit failed EAs without invalidating an otherwise
-                // healthy rebuild. Do not exempt losses from retained EAs or GAs.
-                val comparableDownloads = newEntry.downloads + omittedEaDownloads
-
-                if (baselineDownloads > comparableDownloads) {
-                    LOGGER.error("Stats for ${newEntry.feature_version} are lower than the latest in the db $baselineDownloads > $comparableDownloads (omitted EA downloads: $omittedEaDownloads)")
-                }
-                return@filter baselineDownloads > comparableDownloads
+            if (baselineDownloads > comparableDownloads) {
+                LOGGER.error("Stats for $version are lower than the persisted baseline $baselineDownloads > $comparableDownloads (omitted EA downloads: $omittedEaDownloads)")
             }
-            .isEmpty()
+            baselineDownloads <= comparableDownloads
+        }
     }
 
 }

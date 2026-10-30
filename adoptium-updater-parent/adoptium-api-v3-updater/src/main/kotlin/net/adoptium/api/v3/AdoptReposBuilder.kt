@@ -1,5 +1,6 @@
 package net.adoptium.api.v3
 
+import com.mongodb.MongoException
 import jakarta.enterprise.context.ApplicationScoped
 import jakarta.inject.Inject
 import kotlinx.coroutines.CancellationException
@@ -222,6 +223,7 @@ class AdoptReposBuilder @Inject constructor(
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
+            if (e is MongoException) throw e
             LOGGER.warn("Failed to refresh ${it.id.id}; deferring until a later update", e)
             return null
         }

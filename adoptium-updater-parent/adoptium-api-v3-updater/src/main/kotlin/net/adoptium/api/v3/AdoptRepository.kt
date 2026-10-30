@@ -1,5 +1,6 @@
 package net.adoptium.api.v3
 
+import com.mongodb.MongoException
 import jakarta.enterprise.context.ApplicationScoped
 import jakarta.inject.Inject
 import kotlinx.coroutines.CancellationException
@@ -138,6 +139,7 @@ open class AdoptRepositoryImpl @Inject constructor(
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: Exception) {
+                    if (e is MongoException) throw e
                     if (!release.isPrerelease) throw e
                     LOGGER.warn("Omitting EA ${release.id.id} from full update after failure", e)
                     emptyList()
