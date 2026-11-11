@@ -400,7 +400,10 @@ and statistics guard both use that same baseline. The existing publication
 mutex checks that the generation is unchanged before writing; if an incremental
 publication changed it during the build, discard the stale candidate and reload
 the current committed snapshot. This does not add another publication lock or
-retry queue. Updater reads enumerate the persisted release collection rather
+retry queue. A discarded full build also skips that cycle's statistics update;
+the next daily cycle retries it. Repeated overlap with changed incremental
+publications is not expected (releases change rarely, and the build is
+bounded), so no incremental/full coordination is added. Updater reads enumerate the persisted release collection rather
 than applying the frontend's version range.
 This is the existing single-updater, in-process publication mutex, not a
 distributed compare-and-swap or a transaction across independent writers.

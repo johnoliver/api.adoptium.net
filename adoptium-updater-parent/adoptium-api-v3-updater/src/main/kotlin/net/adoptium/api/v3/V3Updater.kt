@@ -403,15 +403,19 @@ class V3Updater @Inject constructor(
         executor: ScheduledExecutorService
     ): AdoptRepos {
         var repo1 = repo
-        repo1 = fullUpdate(true) ?: repo1
-        repo1 = incrementalUpdate(repo1) ?: repo1
-        if (!incrementalUpdateScheduled.getAndSet(true)) {
-            executor.scheduleWithFixedDelay(
-                updateTask {
-                    repo1 = incrementalUpdate(repo1) ?: repo1
-                },
-                1, 6, TimeUnit.MINUTES
-            )
+        try {
+            repo1 = fullUpdate(true) ?: repo1
+            repo1 = incrementalUpdate(repo1) ?: repo1
+        } finally {
+            // An abandoned first attempt must not suppress later scheduled attempts
+            if (!incrementalUpdateScheduled.getAndSet(true)) {
+                executor.scheduleWithFixedDelay(
+                    updateTask {
+                        repo1 = incrementalUpdate(repo1) ?: repo1
+                    },
+                    1, 6, TimeUnit.MINUTES
+                )
+            }
         }
         repo1 = fullUpdate(false) ?: repo1
         return repo1

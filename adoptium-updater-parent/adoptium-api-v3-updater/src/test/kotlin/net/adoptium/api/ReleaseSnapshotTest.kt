@@ -1,5 +1,6 @@
 package net.adoptium.api
 
+import tools.jackson.databind.exc.MismatchedInputException
 import com.expediagroup.graphql.client.types.GraphQLClientRequest
 import com.expediagroup.graphql.client.types.GraphQLClientResponse
 import io.mockk.coEvery
@@ -160,10 +161,11 @@ class ReleaseSnapshotTest {
         val builder = AdoptReposBuilder(AdoptRepositoryImpl(github, factory), versions)
         assertEquals(nodes(previous), nodes(builder.incrementalUpdate(setOf(complete.name), previous) { null }))
         val error = assertThrows(Exception::class.java) { runBlocking { builder.build(ReleaseIncludeFilter.INCLUDE_ALL) } }
-        assertTrue(error.message!!.contains(when (failure) {
-            "missing-node" -> "Release asset page unavailable"
-            else -> "No data returned"
-        }))
+        if (failure == "decode") {
+            assertTrue(generateSequence<Throwable>(error) { it.cause }.any { it is MismatchedInputException })
+        } else {
+            assertTrue(error.message!!.contains(if (failure == "missing-node") "Release asset page unavailable" else "No data returned"))
+        }
         val database = spyk(InMemoryApiPersistence(previous, mockk()))
         assertNull(database.getLatestGithubStatsForFeatureVersion(8))
         updater(builder, database, versions).runUpdate(previous, AtomicBoolean(true), mockk())

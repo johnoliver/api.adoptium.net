@@ -7,6 +7,7 @@ import io.mockk.every
 import io.mockk.mockk
 import io.mockk.slot
 import io.mockk.spyk
+import io.mockk.verify
 import kotlinx.coroutines.runBlocking
 import net.adoptium.api.testDoubles.InMemoryApiPersistence
 import net.adoptium.api.v3.AdoptReposBuilder
@@ -33,6 +34,7 @@ import net.adoptium.api.v3.dataSources.models.GitHubId
 import net.adoptium.api.v3.dataSources.models.Releases
 import net.adoptium.api.v3.mapping.adopt.AdoptBinaryMapper
 import net.adoptium.api.v3.mapping.adopt.AdoptReleaseMapperFactory
+import net.adoptium.api.v3.models.ReleaseInfo
 import net.adoptium.api.v3.models.Vendor
 import net.adoptium.api.v3.stats.StatsInterface
 import org.junit.jupiter.api.Assertions.assertEquals
@@ -150,6 +152,35 @@ class DatabaseFailurePolicyTest {
         scheduled.captured.run()
 
         coVerify(exactly = 3) { builder.incrementalUpdate(any(), any(), any(), any()) }
+    }
+
+    @Test
+    fun `incomplete release marker does not freeze other dataset refreshes`() {
+        val published = ReleaseInfo(arrayOf(8), arrayOf(8), 8, 8, 8, 77)
+        val database = spyk(InMemoryApiPersistence(before, AdoptCdxaRepos(emptyList())))
+        runBlocking {
+            database.updateAllRepos(before, "incomplete:failed-publication")
+            database.setReleaseInfo(published)
+        }
+        val store = APIDataStoreImpl(database)
+        val periodic = APIDataStoreImpl::class.java.getDeclaredMethod("periodicUpdate").apply { isAccessible = true }
+
+        periodic.invoke(store)
+
+        assertEquals(77, store.getReleaseInfo().tip_version)
+    }
+
+    @Test
+    fun `first-cycle database failure still registers the incremental task`() {
+        val database = spyk(InMemoryApiPersistence(before, AdoptCdxaRepos(emptyList())))
+        val updater = updater(database)
+        val executor = mockk<ScheduledExecutorService>()
+        every { executor.scheduleWithFixedDelay(any(), any(), any(), any()) } returns mockk()
+        coEvery { database.readAllReleaseData() } throws MongoException("Database unavailable")
+
+        assertThrows(MongoException::class.java) { updater.runUpdate(before, AtomicBoolean(false), executor) }
+
+        verify(exactly = 1) { executor.scheduleWithFixedDelay(any(), any(), any(), any()) }
     }
 
     @Test

@@ -331,13 +331,18 @@ open class APIDataStoreImpl : APIDataStore {
 
     private fun periodicUpdate() {
         // Must catch errors or may kill the scheduler
+        LOGGER.debug("periodicUpdate")
+        // Independent refreshes: an incomplete release publication must not freeze unrelated datasets
+        refresh("releases") { binaryRepos = loadDataFromDb(false) }
+        refresh("cdxa") { cdxaRepos = loadCdxaDataFromDb(false) }
+        refresh("release info") { releaseInfo = loadReleaseInfo() }
+    }
+
+    private fun refresh(name: String, load: () -> Unit) {
         try {
-            LOGGER.debug("periodicUpdate")
-            binaryRepos = loadDataFromDb(false)
-            cdxaRepos = loadCdxaDataFromDb(false)
-            releaseInfo = loadReleaseInfo()
+            load()
         } catch (e: Exception) {
-            LOGGER.error("Failed to load db", e)
+            LOGGER.error("Failed to load $name from db", e)
         }
     }
 
