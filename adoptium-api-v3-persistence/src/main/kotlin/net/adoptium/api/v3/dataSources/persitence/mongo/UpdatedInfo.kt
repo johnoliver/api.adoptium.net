@@ -1,6 +1,5 @@
 package net.adoptium.api.v3.dataSources.persitence.mongo
 
-import com.fasterxml.jackson.annotation.JsonIgnore
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties
 import java.time.ZoneId
 import java.time.ZonedDateTime
@@ -18,13 +17,6 @@ data class UpdatedInfo(
         ?.atZone(ZoneId.of("GMT"))
         ?.format(DateTimeFormatter.RFC_1123_DATE_TIME),
     val generationId: String? = null) {
-
-    companion object {
-        const val INCOMPLETE_PREFIX = "incomplete:"
-    }
-
-    @JsonIgnore
-    fun isIncomplete(): Boolean = checksum.startsWith(INCOMPLETE_PREFIX)
 
     override fun toString(): String {
         return "$time $checksum $hashCode $lastModified"

@@ -38,7 +38,7 @@ import net.adoptium.api.v3.models.ReleaseInfo
 import net.adoptium.api.v3.models.Vendor
 import net.adoptium.api.v3.stats.StatsInterface
 import org.junit.jupiter.api.Assertions.assertEquals
-import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertNotEquals
 import org.junit.jupiter.api.Assertions.assertSame
 import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Test
@@ -84,15 +84,12 @@ class DatabaseFailurePolicyTest {
     }
 
     @Test
-    fun `failed publication stays incomplete until a later cycle rebuilds`() = runBlocking {
+    fun `failed publication leaves the previous catalogue usable until a later cycle publishes`() = runBlocking {
         val failure = MongoException("Publication failed")
         val database = object : InMemoryApiPersistence(before, AdoptCdxaRepos(emptyList())) {
             var fail = true
             override suspend fun updateAllRepos(repos: AdoptRepos, checksum: String) {
-                if (fail) {
-                    super.updateAllRepos(before, "incomplete:failed-publication")
-                    throw failure
-                }
+                if (fail) throw failure
                 super.updateAllRepos(repos, checksum)
             }
         }
@@ -106,11 +103,13 @@ class DatabaseFailurePolicyTest {
             builder.incrementalUpdate(any(), any(), any(), any())
             stats.update(any())
         }
-        assertThrows(IllegalStateException::class.java) { APIDataStoreImpl.loadUpdaterSnapshot(database) }
+        val published = database.getUpdatedAt()
+        assertEquals(before, APIDataStoreImpl.loadUpdaterSnapshot(database))
+        assertEquals(before, APIDataStoreImpl(database).loadDataFromDb(true))
 
         database.fail = false
         assertEquals(before, updater.runUpdate(before, AtomicBoolean(true), mockk()))
-        assertFalse(database.getUpdatedAt().isIncomplete())
+        assertNotEquals(published, database.getUpdatedAt())
     }
 
     @ParameterizedTest
@@ -130,7 +129,6 @@ class DatabaseFailurePolicyTest {
             database.updateAllRepos(any(), any())
         }
         coVerify(exactly = 0) { builder.incrementalUpdate(any(), any(), any(), any()) }
-        assertFalse(database.getUpdatedAt().isIncomplete())
 
         coEvery { stats.update(any()) } returns Unit
         coEvery { database.setReleaseInfo(any()) } returns Unit
@@ -155,14 +153,14 @@ class DatabaseFailurePolicyTest {
     }
 
     @Test
-    fun `incomplete release marker does not freeze other dataset refreshes`() {
+    fun `a failed release refresh does not freeze other dataset refreshes`() {
         val published = ReleaseInfo(arrayOf(8), arrayOf(8), 8, 8, 8, 77)
         val database = spyk(InMemoryApiPersistence(before, AdoptCdxaRepos(emptyList())))
         runBlocking {
-            database.updateAllRepos(before, "incomplete:failed-publication")
             database.setReleaseInfo(published)
         }
         val store = APIDataStoreImpl(database)
+        coEvery { database.getUpdatedAt() } throws IllegalStateException("Release refresh failed")
         val periodic = APIDataStoreImpl::class.java.getDeclaredMethod("periodicUpdate").apply { isAccessible = true }
 
         periodic.invoke(store)

@@ -58,6 +58,7 @@ not guarantees about every possible upstream change.
 | GitHub asset IDs and supplied digests provide useful cache identity. | Reuse asset content under that identity; replacing the ID or changing the digest causes a miss. Without either field, fetch on demand rather than assume a URL identifies immutable content. |
 | Asset listings and required sidecar mapping are the supported completeness checks. | Do not download JDK archives to prove availability or verify archive bytes. A successful refresh is not an end-to-end download test of every published binary. |
 | The separate `Release.source` link is outside checksum-exclusion enforcement. | A source archive excluded from `binaries` for a checksum disagreement may remain linked through `source.link`, including across release splits. This is an explicitly accepted limitation, not a defect requiring a fix in this PR. |
+| Temporary EA inconsistency after a failed release publication is acceptable. | A publication that fails midway can leave an EA with old splits plus some new ones, and a full `RELEASES_ONLY` rebuild preserves EAs, so the mixed set can be published as complete until the next incremental update replaces every split of that EA (I4). This is an explicitly accepted, short-lived limitation: EAs are less critical than GA releases and self-heal on the next incremental. Do not add a persisted failure flag, an incomplete marker, an `ALL`-mode recovery rebuild or a pointer switch for it. The catalogue stays loadable throughout (I3). GA releases are not exposed this way because a full rebuild replaces them. |
 | Transient failures can be retried by normal future selection. | Do not add a persisted retry queue or per-release deadline. Network retries can delay a cycle, and a failed historical EA is not guaranteed another attempt every cycle. |
 
 In particular, an older EA edited across the full-update age cutoff is not a
@@ -108,9 +109,9 @@ three application attempts are not a limit on wire commands or elapsed time.
 A permanent failure or exhausted operation budget abandons the entire current
 update attempt rather than being isolated to one release or retried at a higher
 layer. The scheduler logs the failure and remains active for the next scheduled
-cycle. Already completed database writes are not rolled back;
-incomplete-publication markers and reader checks remain necessary.
-Generation markers detect incomplete publication; they are not backups. A later
+cycle. Already completed database writes are not rolled back; because
+publication never removes a release before its replacement exists (below), the
+database stays usable after any failure. A later
 full rebuild uses surviving records and the normal retrieval filters, so it
 cannot guarantee restoration of records already deleted outside those filters,
 such as excluded legacy releases. That remains an operational data-recovery
@@ -134,7 +135,7 @@ do not expand that scope to make a regression pass.
 | --- | --- | --- |
 | I1 | Updater baselines include persisted releases and download attribution independently of API visibility filters or serving-version caps. | Updater snapshot loading: include a zero-binary release and a version above the frontend cap; exercise real MongoDB reads as well as an in-memory double. |
 | I2 | A replacement cannot silently discard newer published work within a feature version it replaces. | Build-to-publication handoff: publish an incremental change after the full-build baseline is captured, then attempt the stale full publication. |
-| I3 | A partial release-catalogue publication is never accepted as a committed generation. Recovery read failure cannot become an empty successful baseline. | Mongo publication and snapshot loading: fail invalidation, release writes, final publication, or recovery reads; repeat after restart and republish identical content within the same second during a read. |
+| I3 | The release database is usable at every point: a release is never removed before its replacement exists, and the generation advances only after all writes. A startup read failure cannot become an empty successful baseline. | Mongo publication and snapshot loading: reject release writes or the final publication and assert the previous catalogue stays readable; republish identical content within the same second during a read; republish without duplicates. |
 | I4 | One upstream release is replaced as a complete set of splits, never a mixture of refreshed and stale binaries. Failures follow the update-mode policies below. | Mapping and builders: fail one required sidecar in a multi-binary release under both full and incremental updates, retaining explicit per-artifact checksum exclusions. |
 | I5 | Non-empty feature replacements remove obsolete releases; missing or empty features preserve stored records. Download-loss guards account for stored and rebuilt versions, including versions absent from the candidate. | Mongo persistence and the full-update guard: exercise absent, explicitly empty, and partially populated feature versions separately and assert download totals explicitly. |
 | I6 | Asset-list ordering cannot hide an available, unambiguous sidecar or change checksum decisions. | Sidecar selection: permute exact matches, ambiguous aliases and valid more-specific aliases. |
@@ -341,8 +342,7 @@ or legacy-specific recovery solely to eliminate this exceptional failure case.
   operation's retry budget is exhausted, or immediately when retry is unsafe or
   the failure is permanent. They stop the remaining phases of the scheduled
   update; append-only statistics writes are not replayed. Later scheduled
-  attempts use the normal baseline-read and full-build paths; incremental
-  publication still defers while the generation is incomplete.
+  attempts use the normal baseline-read and full-build paths.
 - Non-retryable mapping results are omitted, as are releases rejected by policy.
 - A successful EA refresh replaces every previous split; a successful empty
   result removes them. Failed EAs and policy exclusions are both absent from the
@@ -362,37 +362,37 @@ Aborting a build before publication leaves the existing database catalogue in
 place. The scheduler can continue with other update attempts; this does not
 guarantee rollback of a database failure after publication has begun.
 
-Publication to MongoDB is not atomic, so the generation marker guards it. Before
-changing any release, a fresh `incomplete:<uuid>` marker replaces the published
-checksum; the target checksum is written only after every feature version has
-been processed. Every completed publication also persists a fresh `generationId`,
-separate from its content checksum and timestamp. Reader and full-build marker
-comparisons include this identity, so republishing unchanged content within the
-same second cannot hide an intervening delete/insert. Allocate the identity once
-per marker write and reuse it across that operation's bounded retries. Legacy
-records without this field retain a stable `null` identity until rewritten;
-reading an old record must not manufacture a new identity.
+Publication to MongoDB is not atomic, so it is ordered to keep the database
+usable at every point; the database is never left in a state a starting frontend
+cannot load. For each non-empty feature version, every release is upserted by its
+`id` (idempotent, so bounded retries are safe), and only then are releases of that
+feature version whose ids are not in the new set deleted. A release is never
+removed before its replacement exists. The target checksum is written only after
+every feature version has been processed. A failure at any point leaves the
+previous generation marker with a catalogue made of complete, valid releases:
+the previous ones, plus any already-replaced or newly added ones, and possibly
+superseded releases that the next successful publication removes. There is no
+incomplete marker, and readers and updater startup need no special recovery
+path. A reader that loads during publication may briefly see old and new
+releases together under the previous marker; it reloads when the marker advances.
+Every completed publication also persists a fresh `generationId`, separate from
+its content checksum and timestamp. Reader and full-build marker comparisons
+include this identity, so republishing unchanged content within the same second
+cannot hide an intervening change. Allocate the identity once per marker write
+and reuse it across that operation's bounded retries. Legacy records without
+this field retain a stable `null` identity until rewritten; reading an old record
+must not manufacture a new identity.
 
 Only non-empty feature versions replace stored records; absent
-and explicitly empty feature versions are left unchanged under the scope above. A
-failure therefore leaves a marker that matches neither the previous nor the
-target generation. Readers reject an incomplete marker, or a marker that changes
-while loading, and keep serving their cached catalogue. Incremental updates defer
-while the marker is incomplete, and the next full rebuild replaces the partial
-data and completes the generation. After an updater restart, the rebuild
-baseline is read from the surviving records of an incomplete generation (never
-served to API readers) rather than an empty catalogue, so the first
-`RELEASES_ONLY` rebuild preserves data outside its filter.
-If that recovery read fails, updater startup aborts before scheduling any
-updates; it never substitutes an empty catalogue for an unreadable baseline.
-Startup can be retried once the database is readable again.
-Updater startup, recovery baselines and incremental checksum reconciliation use
-the unfiltered persisted snapshot. API-only filtering must not feed publication:
-in particular, internal releases with no binaries retain their download counts
-even though the frontend hides them. Normal updater snapshot reads still reject
-incomplete generations; only recovery baseline reads permit them.
-Deferring incremental publication does not schedule an immediate full rebuild:
-the existing daily full-update schedule remains the retry opportunity.
+and explicitly empty feature versions are left unchanged under the scope above.
+Readers reject a marker that changes while loading and keep serving their cached
+catalogue. If the updater cannot read its startup baseline, startup aborts before
+scheduling any updates; it never substitutes an empty catalogue for an unreadable
+baseline, and can be retried once the database is readable again.
+Updater startup and incremental checksum reconciliation use the unfiltered
+persisted snapshot. API-only filtering must not feed publication: in particular,
+internal releases with no binaries retain their download counts even though the
+frontend hides them.
 
 Each full build captures one complete persisted baseline with its generation,
 instead of reusing the scheduler's startup catalogue. The preservation filter
@@ -581,9 +581,9 @@ that these local changes are already present in the remote PR.
 | Installer metadata | Do not load installer metadata for validation; use its checksum sidecar for the installer checksum. | Load matching installer metadata through the asset-aware cache and include its SHA-256 in agreement checks. Missing metadata assets are allowed; listed metadata that cannot be read or parsed excludes only the installer, not its archive. |
 | Cache writes | Wait for completion-only jobs; their asynchronous write failure does not propagate through `join()`. | Await the result under a per-key lock, retaining ordering through cancellation. Permanent or exhausted cache-write failure fails the shared fetch and aborts the update. |
 | Updater baseline | Use the API's filtered, serving-version-limited projection for startup and checksum reconciliation. Full builds preserve from the supplied in-memory catalogue. | Read the entire persisted catalogue, including zero-binary accounting records. Each full build captures its own baseline and generation for both preservation and statistics. |
-| Publication and readers | Write the target generation in `finally`, even after failed release writes. Reader loads do not reject an incomplete or changing generation. | Invalidate before release writes, commit only after success, and reject incomplete/changing reader snapshots. Discard a full candidate when its baseline generation changed during the build. |
+| Publication and readers | Write the target generation in `finally`, even after failed release writes. Reader loads do not reject an incomplete or changing generation. | Upsert-then-delete release writes, commit the generation only after success, and reject changing reader snapshots. Discard a full candidate when its baseline generation changed during the build. |
 | Database failures | Several release/optional-artifact boundaries can log and downgrade database failures. Failed full updates can continue into subsequent phases. | Retry known transient failures only at individual safe Mongo-operation boundaries, then propagate to the scheduler and stop the current attempt. Keep later scheduled attempts alive. |
-| Attestation generation | Advance the generation in `finally`, even after failed attestation writes. | Advance only after successful writes; do not replay ambiguous inserts. This does not add the release catalogue's incomplete-generation protocol to CDXA. |
+| Attestation generation | Advance the generation in `finally`, even after failed attestation writes. | Advance only after successful writes; do not replay ambiguous inserts. This does not add the release catalogue's upsert-then-delete ordering to CDXA. |
 | Known tag exclusions | Reject `jdk-11.0.13'+8` and `jdk17u-2022-05-27-19-32-beta` before mapping, including GA releases. | Filter successfully mapped EA results only. An empty filtered result removes old incremental splits; GA releases are not excluded by these rules. |
 
 The merged upstream baseline already implements the following protections; they

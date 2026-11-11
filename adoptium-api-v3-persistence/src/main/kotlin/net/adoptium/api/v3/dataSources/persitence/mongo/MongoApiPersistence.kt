@@ -1,7 +1,10 @@
 package net.adoptium.api.v3.dataSources.persitence.mongo
 
+import com.mongodb.client.model.BulkWriteOptions
+import com.mongodb.client.model.Filters
 import com.mongodb.client.model.IndexOptions
 import com.mongodb.client.model.InsertManyOptions
+import com.mongodb.client.model.ReplaceOneModel
 import com.mongodb.client.model.ReplaceOptions
 import com.mongodb.kotlin.client.coroutine.MongoCollection
 import jakarta.enterprise.context.ApplicationScoped
@@ -41,7 +44,22 @@ import java.util.UUID
 @ApplicationScoped
 open class MongoApiPersistence @Inject constructor(mongoClient: MongoClient) : MongoInterface(), ApiPersistence {
     private val githubReleaseMetadataCollection: MongoCollection<GHReleaseMetadata> = createCollection(mongoClient.getDatabase(), GH_RELEASE_METADATA)
-    private val releasesCollection: MongoCollection<Release> = createCollection(mongoClient.getDatabase(), RELEASE_DB)
+    private val releasesCollection: MongoCollection<Release> = createCollection(
+        mongoClient.getDatabase(),
+        RELEASE_DB,
+        ensureIndexes = { collection ->
+            try {
+                runBlocking {
+                    retryMongoOperation("create release id index") {
+                        collection.createIndex(Document("id", 1))
+                    }
+                }
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                LOGGER.warn("Failed to create index for releases: ${e.message}")
+            }
+        }
+    )
     private var cdxasCollection: MongoCollection<Cdxa> = createCollection(mongoClient.getDatabase(), CDXAS_DB)
     private val gitHubStatsCollection: MongoCollection<GitHubDownloadStatsDbEntry> = createCollection(mongoClient.getDatabase(), GITHUB_STATS_DB)
     private val dockerStatsCollection: MongoCollection<DockerDownloadStatsDbEntry> = createCollection(mongoClient.getDatabase(), DOCKER_STATS_DB)
@@ -103,10 +121,9 @@ open class MongoApiPersistence @Inject constructor(mongoClient: MongoClient) : M
     }
 
     override suspend fun updateAllRepos(repos: AdoptRepos, checksum: String) {
-        // Deletes and inserts are not atomic. Invalidate the published generation before
-        // mutating so a partial failure is never served or mistaken for the previous or
-        // target generation. A fresh token also invalidates rebuilds based on an earlier one.
-        updateUpdatedTime(TimeSource.now(), "${UpdatedInfo.INCOMPLETE_PREFIX}${UUID.randomUUID()}", 0)
+        // Writes never remove a release before its replacement exists, so the database is
+        // usable at every point and a failure leaves old and new releases, each complete.
+        // The published generation only advances once every feature version is written.
         repos.repos.forEach { (version, releases) ->
             writeReleases(version, releases)
         }
@@ -126,10 +143,17 @@ open class MongoApiPersistence @Inject constructor(mongoClient: MongoClient) : M
         val toAdd = value.releases.getReleases().toList()
         // Empty features are not whole-version deletion requests; see ADR 8.
         if (toAdd.isNotEmpty()) {
-            retryMongoOperation("delete releases for feature $featureVersion") {
-                releasesCollection.deleteMany(majorVersionMatcher(featureVersion))
+            retryMongoOperation("upsert releases for feature $featureVersion") {
+                releasesCollection.bulkWrite(
+                    toAdd.map { ReplaceOneModel(Document("id", it.id), it, ReplaceOptions().upsert(true)) },
+                    BulkWriteOptions().ordered(false)
+                )
             }
-            releasesCollection.insertMany(toAdd, InsertManyOptions())
+            retryMongoOperation("delete superseded releases for feature $featureVersion") {
+                releasesCollection.deleteMany(
+                    Filters.and(majorVersionMatcher(featureVersion), Filters.nin("id", toAdd.map { it.id }))
+                )
+            }
         }
     }
 

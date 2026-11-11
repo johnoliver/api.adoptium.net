@@ -34,7 +34,7 @@ import java.time.ZonedDateTime
 class MongoAPIPersistenceTests : MongoTest() {
 
     @ParameterizedTest
-    @ValueSource(strings = ["frontend", "updater", "recovery"])
+    @ValueSource(strings = ["frontend", "updater"])
     fun `same-second identical republication invalidates an overlapping snapshot read`(reader: String): Unit = runBlocking {
         val time = TimeSource.now()
         val api = object : MongoApiPersistence(MongoClient()) {
@@ -60,11 +60,8 @@ class MongoAPIPersistenceTests : MongoTest() {
         }
 
         assertThrows(IllegalStateException::class.java) {
-            when (reader) {
-                "frontend" -> APIDataStoreImpl.loadDataFromDb(overlapping, before, true, repo, listOf(8), false)
-                "updater" -> APIDataStoreImpl.loadUpdaterSnapshot(overlapping)
-                else -> APIDataStoreImpl.loadRecoveryBaseline(overlapping)
-            }
+            if (reader == "frontend") APIDataStoreImpl.loadDataFromDb(overlapping, before, true, repo, listOf(8), false)
+            else APIDataStoreImpl.loadUpdaterSnapshot(overlapping)
         }
 
         val after = MongoApiPersistence(MongoClient()).getUpdatedAt()
@@ -75,6 +72,43 @@ class MongoAPIPersistenceTests : MongoTest() {
         assertNotEquals(before, after)
         assertEquals(repo.getFeatureRelease(8)!!.releases.nodes,
             APIDataStoreImpl.loadUpdaterSnapshot(api).getFeatureRelease(8)!!.releases.nodes)
+    }
+
+    @Test
+    fun `republication replaces releases by id without duplicates or an unusable window`(): Unit = runBlocking {
+        val api = MongoApiPersistence(MongoClient())
+        val all = BaseTest.adoptRepos.getFeatureRelease(8)!!.releases.nodeList.take(3)
+        api.updateAllRepos(AdoptRepos(listOf(FeatureRelease(8, Releases(all)))), "first")
+        val kept = all.first()
+
+        api.updateAllRepos(AdoptRepos(listOf(FeatureRelease(8, Releases(listOf(kept, kept))))), "second")
+
+        assertEquals(listOf(kept.id), api.readReleaseData(8).releases.nodeList.map { it.id })
+    }
+
+    @Test
+    fun `a publication interrupted before the final generation write leaves every release readable`(): Unit = runBlocking {
+        val failure = IllegalStateException("interrupted")
+        val api = object : MongoApiPersistence(MongoClient()) {
+            var fail = false
+            override suspend fun updateUpdatedTime(dateTime: ZonedDateTime, checksum: String, hashCode: Int) {
+                if (fail) throw failure
+                super.updateUpdatedTime(dateTime, checksum, hashCode)
+            }
+        }
+        val all = BaseTest.adoptRepos.getFeatureRelease(8)!!.releases.nodeList.take(3)
+        api.updateAllRepos(AdoptRepos(listOf(FeatureRelease(8, Releases(all.take(2))))), "first")
+        val published = api.getUpdatedAt()
+        api.fail = true
+
+        assertSame(failure, assertThrows(IllegalStateException::class.java) {
+            runBlocking { api.updateAllRepos(AdoptRepos(listOf(FeatureRelease(8, Releases(all.drop(1))))), "second") }
+        })
+
+        assertEquals(published, api.getUpdatedAt())
+        assertEquals(all.map { it.id }.toSet(), api.readReleaseData(8).releases.nodeList.map { it.id }.toSet().let { it + all.first().id })
+        assertTrue(api.readReleaseData(8).releases.nodeList.map { it.id }.containsAll(all.drop(1).map { it.id }))
+        APIDataStoreImpl.loadUpdaterSnapshot(api)
     }
 
     @Test
@@ -111,7 +145,7 @@ class MongoAPIPersistenceTests : MongoTest() {
     }
 
     @Test
-    fun `partial insert failure invalidates generation and permits recovery`(): Unit = runBlocking {
+    fun `rejected release writes leave the published catalogue intact and permit recovery`(): Unit = runBlocking {
         val client = MongoClient()
         val api = MongoApiPersistence(client)
         val oldRelease = BaseTest.adoptRepos.getFeatureRelease(8)!!.releases.nodeList.first()
@@ -124,24 +158,20 @@ class MongoAPIPersistenceTests : MongoTest() {
         val oldChecksum = V3Updater.calculateChecksum(before)
         val targetChecksum = V3Updater.calculateChecksum(target)
         api.updateAllRepos(before, oldChecksum)
-        // Reject inserts only, so updateAllRepos deletes the old feature before failing.
+        // Reject all release writes; nothing may be removed before its replacement exists.
         client.getDatabase().runCommand(Document("collMod", MongoApiPersistence.RELEASE_DB)
             .append("validator", Document("generationFailureTest", Document("\$exists", true))))
         try {
-            var previousMarker = oldChecksum
             repeat(2) {
                 val error = assertThrows(MongoBulkWriteException::class.java) {
                     runBlocking { api.updateAllRepos(target, targetChecksum) }
                 }
                 assertTrue(error.writeErrors.any { it.code == 121 }, "Propagate Mongo's document validation failure")
                 val restarted = MongoApiPersistence(MongoClient())
-                assertTrue(restarted.readReleaseData(8).releases.nodes.isEmpty())
+                assertEquals(setOf(oldRelease.id), restarted.readReleaseData(8).releases.nodes.keys)
                 assertEquals(setOf(omitted.id), restarted.readReleaseData(11).releases.nodes.keys)
-                val failedMarker = restarted.getUpdatedAt().checksum
-                assertNotEquals(oldChecksum, failedMarker)
-                assertNotEquals(targetChecksum, failedMarker)
-                assertNotEquals(previousMarker, failedMarker, "Every failed attempt must invalidate its source generation")
-                previousMarker = failedMarker
+                assertEquals(oldChecksum, restarted.getUpdatedAt().checksum)
+                APIDataStoreImpl.loadUpdaterSnapshot(restarted)
             }
         } finally {
             client.getDatabase().runCommand(Document("collMod", MongoApiPersistence.RELEASE_DB)
@@ -155,9 +185,8 @@ class MongoAPIPersistenceTests : MongoTest() {
         assertEquals(targetChecksum, recovered.getUpdatedAt().checksum)
     }
 
-    @ParameterizedTest
-    @ValueSource(booleans = [false, true])
-    fun `marker failure propagates original exception without publishing target`(failOnPublish: Boolean): Unit = runBlocking {
+    @Test
+    fun `generation write failure propagates original exception without publishing target`(): Unit = runBlocking {
         val release = BaseTest.adoptRepos.getFeatureRelease(8)!!.releases.nodeList.first()
         val replacement = BaseTest.adoptRepos.getFeatureRelease(8)!!.releases.nodeList.drop(1).first()
         val before = AdoptRepos(listOf(FeatureRelease(8, Releases(listOf(release)))))
@@ -168,7 +197,7 @@ class MongoAPIPersistenceTests : MongoTest() {
         var fail = false
         val api = object : MongoApiPersistence(MongoClient()) {
             override suspend fun updateUpdatedTime(dateTime: ZonedDateTime, checksum: String, hashCode: Int) {
-                if (fail && (checksum == targetChecksum) == failOnPublish) throw failure
+                if (fail && checksum == targetChecksum) throw failure
                 super.updateUpdatedTime(dateTime, checksum, hashCode)
             }
         }
@@ -178,15 +207,9 @@ class MongoAPIPersistenceTests : MongoTest() {
             runBlocking { api.updateAllRepos(target, targetChecksum) }
         })
         val restarted = MongoApiPersistence(MongoClient())
-        assertNotEquals(targetChecksum, restarted.getUpdatedAt().checksum)
-        if (failOnPublish) {
-            assertNotEquals(oldChecksum, restarted.getUpdatedAt().checksum)
-            assertEquals(setOf(replacement.id), restarted.readReleaseData(8).releases.nodes.keys)
-        } else {
-            // Failed invalidation must prevent all destructive release writes.
-            assertEquals(oldChecksum, restarted.getUpdatedAt().checksum)
-            assertEquals(setOf(release.id), restarted.readReleaseData(8).releases.nodes.keys)
-        }
+        assertEquals(oldChecksum, restarted.getUpdatedAt().checksum)
+        assertTrue(restarted.readReleaseData(8).releases.nodes.keys.containsAll(setOf(replacement.id)))
+        APIDataStoreImpl.loadUpdaterSnapshot(restarted)
         fail = false
         api.updateAllRepos(target, targetChecksum)
         assertEquals(targetChecksum, restarted.getUpdatedAt().checksum)

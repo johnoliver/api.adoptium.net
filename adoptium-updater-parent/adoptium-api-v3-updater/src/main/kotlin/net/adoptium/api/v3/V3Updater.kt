@@ -279,11 +279,6 @@ class V3Updater @Inject constructor(
         }
 
         return mutex.withLock {
-            // A failed publication leaves a partial database; only a full rebuild can complete it.
-            if (database.getUpdatedAt().isIncomplete()) {
-                LOGGER.warn("Deferring incremental update until a full rebuild replaces the incomplete publication")
-                return@withLock oldRepo
-            }
             // Ensure that the database has not been updated since calculating the incremental update
             if (database.getUpdatedAt().checksum == oldChecksum) {
                 database.updateAllRepos(updatedRepo, checksum)
@@ -340,17 +335,6 @@ class V3Updater @Inject constructor(
         }
     }
 
-    // An incomplete generation is not servable, but the rebuild still needs its surviving records
-    // so that releases outside the first rebuild's filter are not deleted.
-    private fun loadRecoveryBaseline(): AdoptRepos {
-        return try {
-            APIDataStoreImpl.loadRecoveryBaseline(database)
-        } catch (e: Exception) {
-            LOGGER.error("Failed to load recovery baseline; refusing to start updates", e)
-            throw e
-        }
-    }
-
     fun run(instantFullUpdate: Boolean) {
         assertConnectedToDb()
 
@@ -365,7 +349,8 @@ class V3Updater @Inject constructor(
                 Quarkus.asyncExit(2)
                 Quarkus.waitForExit()
             }
-            loadRecoveryBaseline()
+            // An empty baseline would let the first rebuild delete releases outside its filter.
+            throw e
         }
 
         var cdxaRepo: AdoptCdxaRepos = try {
@@ -475,10 +460,10 @@ class V3Updater @Inject constructor(
                 updatableVersionSupplier.updateVersions()
 
                 val (currentRepo, generation) = mutex.withLock {
-                    APIDataStoreImpl.loadUpdaterSnapshotWithInfo(database, allowIncomplete = true)
+                    APIDataStoreImpl.loadUpdaterSnapshotWithInfo(database)
                 }
 
-                val filterType: ReleaseFilterType = if (releasesOnly && !generation.isIncomplete()) {
+                val filterType: ReleaseFilterType = if (releasesOnly) {
                     ReleaseFilterType.RELEASES_ONLY
                 } else {
                     ReleaseFilterType.ALL

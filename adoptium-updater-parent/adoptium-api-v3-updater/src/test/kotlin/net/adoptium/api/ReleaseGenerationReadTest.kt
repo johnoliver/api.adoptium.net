@@ -22,38 +22,20 @@ import net.adoptium.api.v3.dataSources.persitence.mongo.UpdatedInfo
 import org.junit.jupiter.api.Assertions.*
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.params.ParameterizedTest
-import org.junit.jupiter.params.provider.CsvSource
 import org.junit.jupiter.params.provider.ValueSource
 
 class ReleaseGenerationReadTest {
     private val previous = UpdatedInfo(TimeSource.now().minusDays(1), "previous", 1)
     private val empty = AdoptRepos(emptyList())
 
-    @ParameterizedTest
-    @CsvSource("complete,incomplete:writing", "complete,new-complete", "incomplete:writing,new-complete")
-    fun `unpublished or changing snapshots are rejected even on forced reads`(start: String, end: String) {
+    @Test
+    fun `changing snapshots are rejected even on forced reads`() {
         val database = mockk<ApiPersistence>()
-        coEvery { database.getUpdatedAt() } returnsMany listOf(
-            previous.copy(checksum = start), previous.copy(checksum = end)
-        )
+        coEvery { database.getUpdatedAt() } returnsMany listOf(previous, previous.copy(checksum = "new-complete"))
         coEvery { database.readReleaseData(8) } returns FeatureRelease(8, emptyList())
         assertThrows(IllegalStateException::class.java) {
             APIDataStoreImpl.loadDataFromDb(database, previous, true, empty, listOf(8), false)
         }
-        if (start.startsWith("incomplete:")) coVerify(exactly = 0) { database.readReleaseData(any()) }
-    }
-
-    @Test
-    fun `incomplete generation is not accepted on startup or as a poll cache hit`() {
-        val database = mockk<ApiPersistence>()
-        val incomplete = previous.copy(checksum = "incomplete:failed")
-        coEvery { database.getUpdatedAt() } returns incomplete
-        for (oldRepo in listOf(null, empty)) {
-            assertThrows(IllegalStateException::class.java) {
-                APIDataStoreImpl.loadDataFromDb(database, incomplete, false, oldRepo, listOf(8), false)
-            }
-        }
-        coVerify(exactly = 0) { database.readReleaseData(any()) }
     }
 
     @Test
@@ -68,25 +50,16 @@ class ReleaseGenerationReadTest {
         coVerify(exactly = 1) { database.readAllReleaseData() }
     }
 
-    @Test
-    fun `recovery baseline reads the surviving records of an incomplete generation`() {
-        val database = mockk<ApiPersistence>()
-        coEvery { database.getUpdatedAt() } returns previous.copy(checksum = "incomplete:failed")
-        coEvery { database.readAllReleaseData() } returns empty
-        APIDataStoreImpl.loadRecoveryBaseline(database)
-        coVerify { database.readAllReleaseData() }
-    }
-
     @ParameterizedTest
     @ValueSource(strings = ["mongo", "generation", "cancelled"])
-    fun `failed recovery baseline aborts startup before scheduling updates`(kind: String) {
+    fun `failed startup snapshot read aborts startup before scheduling updates`(kind: String) {
         val failure = when (kind) {
             "mongo" -> MongoException("Recovery read failed")
             "generation" -> IllegalStateException("Generation changed during recovery")
             else -> CancellationException("Recovery cancelled")
         }
         val database = mockk<ApiPersistence>()
-        coEvery { database.getUpdatedAt() } returns previous.copy(checksum = "incomplete:failed")
+        coEvery { database.getUpdatedAt() } returns previous
         coEvery { database.readAllReleaseData() } throws failure
         val store = mockk<APIDataStore>()
         coEvery { store.isConnectedToDb() } returns true
@@ -101,22 +74,6 @@ class ReleaseGenerationReadTest {
             builder.build(any())
         }
         verify(exactly = 0) { store.loadCdxaDataFromDb(any(), any()) }
-    }
-
-    @Test
-    fun `rejected read preserves cached generation and a later successful poll reloads`() = runBlocking {
-        val database = InMemoryApiPersistence(empty, AdoptCdxaRepos(emptyList()))
-        database.updateAllRepos(empty, "published")
-        val store = APIDataStoreImpl(database)
-        val cached = store.getAdoptRepos()
-        val generation = store.getUpdateInfo()
-        database.updateAllRepos(empty, "incomplete:failed")
-        assertThrows(IllegalStateException::class.java) { store.loadDataFromDb(true) }
-        assertSame(cached, store.getAdoptRepos())
-        assertEquals(generation, store.getUpdateInfo())
-        database.updateAllRepos(empty, "recovered")
-        store.loadDataFromDb(false)
-        assertEquals("recovered", store.getUpdateInfo().checksum)
     }
 
     @Test

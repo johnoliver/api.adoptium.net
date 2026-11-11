@@ -7,6 +7,8 @@ import com.mongodb.MongoSocketReadException
 import com.mongodb.MongoTimeoutException
 import com.mongodb.ServerAddress
 import com.mongodb.client.model.InsertManyOptions
+import com.mongodb.bulk.BulkWriteResult
+import com.mongodb.client.model.WriteModel
 import com.mongodb.client.result.UpdateResult
 import com.mongodb.kotlin.client.coroutine.FindFlow
 import com.mongodb.kotlin.client.coroutine.MongoCollection
@@ -204,11 +206,16 @@ class MongoRetryTest {
     }
 
     @Test
-    fun `feature deletion retries only the safe operation before inserting once`() = runBlocking {
+    fun `release upserts and superseded deletes retry because they are idempotent`() = runBlocking {
         val releases = collection<Release>(MongoApiPersistence.RELEASE_DB)
-        var attempts = 0
+        var writes = 0
+        var deletes = 0
+        coEvery { releases.bulkWrite(any<List<WriteModel<Release>>>(), any()) } coAnswers {
+            if (++writes < 3) throw transient("socket")
+            BulkWriteResult.unacknowledged()
+        }
         coEvery { releases.deleteMany(any<Bson>(), any()) } coAnswers {
-            if (++attempts < 3) throw transient("socket")
+            if (++deletes < 3) throw transient("socket")
             com.mongodb.client.result.DeleteResult.acknowledged(1)
         }
         val release = BaseTest.adoptRepos.getFeatureRelease(8)!!.releases.nodeList.first()
@@ -216,29 +223,24 @@ class MongoRetryTest {
 
         MongoApiPersistence(client).updateAllRepos(snapshot, "target")
 
-        assertEquals(3, attempts)
-        coVerify(exactly = 1) { releases.insertMany(any<List<Release>>(), any<InsertManyOptions>()) }
+        assertEquals(3, writes)
+        assertEquals(3, deletes)
     }
 
     @Test
-    fun `release publication never retries an ambiguously completed insert or restarts the publication`() = runBlocking {
+    fun `exhausted release upserts leave existing releases untouched and unpublished`() = runBlocking {
         val releases = collection<Release>(MongoApiPersistence.RELEASE_DB)
         val generations = collection<UpdatedInfo>(MongoApiPersistence.UPDATE_TIME_DB)
         val failure = transient("socket")
-        coEvery { releases.insertMany(any<List<Release>>(), any<InsertManyOptions>()) } throws failure
+        coEvery { releases.bulkWrite(any<List<WriteModel<Release>>>(), any()) } throws failure
         val release = BaseTest.adoptRepos.getFeatureRelease(8)!!.releases.nodeList.first()
         val snapshot = AdoptRepos(listOf(FeatureRelease(8, Releases(listOf(release)))))
         val error = runCatching { MongoApiPersistence(client).updateAllRepos(snapshot, "target") }.exceptionOrNull()
 
         assertSame(failure, error)
-        coVerify(exactly = 1) { releases.insertMany(any<List<Release>>(), any<InsertManyOptions>()) }
-        coVerify(exactly = 1) { releases.deleteMany(any<Bson>(), any()) }
-        coVerify(exactly = 1) {
-            generations.replaceOne(any<Bson>(), match { it.isIncomplete() }, any())
-        }
-        coVerify(exactly = 0) {
-            generations.replaceOne(any<Bson>(), match { it.checksum == "target" }, any())
-        }
+        coVerify(exactly = 3) { releases.bulkWrite(any<List<WriteModel<Release>>>(), any()) }
+        coVerify(exactly = 0) { releases.deleteMany(any<Bson>(), any()) }
+        coVerify(exactly = 0) { generations.replaceOne(any<Bson>(), any(), any()) }
     }
 
     @Test

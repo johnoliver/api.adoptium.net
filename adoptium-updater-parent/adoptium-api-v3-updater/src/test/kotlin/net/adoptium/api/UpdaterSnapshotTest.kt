@@ -19,8 +19,6 @@ import net.adoptium.api.v3.models.Vendor
 import net.adoptium.api.v3.models.VersionData
 import org.junit.jupiter.api.Assertions.*
 import org.junit.jupiter.api.Test
-import org.junit.jupiter.params.ParameterizedTest
-import org.junit.jupiter.params.provider.ValueSource
 import java.util.concurrent.atomic.AtomicBoolean
 
 class UpdaterSnapshotTest {
@@ -45,31 +43,22 @@ class UpdaterSnapshotTest {
         database.updateAllRepos(stored, V3Updater.calculateChecksum(stored))
 
         assertNull(APIDataStoreImpl(database).loadDataFromDb(true).getFeatureRelease(version))
-        for (snapshot in listOf(APIDataStoreImpl.loadUpdaterSnapshot(database), APIDataStoreImpl.loadRecoveryBaseline(database))) {
-            assertEquals(aboveCap.download_count, snapshot.allReleases.nodes.getValue(aboveCap.id).download_count)
-            assertEquals(V3Updater.calculateChecksum(stored), V3Updater.calculateChecksum(snapshot))
-        }
+        val snapshot = APIDataStoreImpl.loadUpdaterSnapshot(database)
+        assertEquals(aboveCap.download_count, snapshot.allReleases.nodes.getValue(aboveCap.id).download_count)
+        assertEquals(V3Updater.calculateChecksum(stored), V3Updater.calculateChecksum(snapshot))
     }
 
-    @ParameterizedTest
-    @ValueSource(booleans = [false, true])
-    fun `updater snapshot preserves internal releases without changing the frontend view`(incomplete: Boolean) = runBlocking {
+    @Test
+    fun `updater snapshot preserves internal releases without changing the frontend view`() = runBlocking {
         val database = InMemoryApiPersistence(before, AdoptCdxaRepos(emptyList()))
-        val checksum = if (incomplete) "incomplete:failed" else V3Updater.calculateChecksum(before)
+        val checksum = V3Updater.calculateChecksum(before)
         database.updateAllRepos(before, checksum)
-        if (incomplete) {
-            assertThrows(IllegalStateException::class.java) { APIDataStoreImpl.loadUpdaterSnapshot(database) }
-        } else {
-            val serving = APIDataStoreImpl(database).loadDataFromDb(true)
-            assertTrue(serving.allReleases.hasReleaseId(GitHubId(healthy.id)))
-            assertFalse(serving.allReleases.hasReleaseId(GitHubId(hidden.id)))
-            val snapshot = APIDataStoreImpl.loadUpdaterSnapshot(database)
-            assertEquals(checksum, V3Updater.calculateChecksum(snapshot))
-            assertEquals(50L, snapshot.allReleases.nodes.getValue(hidden.id).download_count)
-        }
-        val recovered = APIDataStoreImpl.loadRecoveryBaseline(database)
-        assertEquals(V3Updater.calculateChecksum(before), V3Updater.calculateChecksum(recovered))
-        assertEquals(50L, recovered.allReleases.nodes.getValue(hidden.id).download_count)
+        val serving = APIDataStoreImpl(database).loadDataFromDb(true)
+        assertTrue(serving.allReleases.hasReleaseId(GitHubId(healthy.id)))
+        assertFalse(serving.allReleases.hasReleaseId(GitHubId(hidden.id)))
+        val snapshot = APIDataStoreImpl.loadUpdaterSnapshot(database)
+        assertEquals(checksum, V3Updater.calculateChecksum(snapshot))
+        assertEquals(50L, snapshot.allReleases.nodes.getValue(hidden.id).download_count)
     }
 
     @Test

@@ -47,7 +47,6 @@ open class APIDataStoreImpl : APIDataStore {
 
             return runBlocking {
                 val updated = dataStore.getUpdatedAt()
-                check(!updated.isIncomplete()) { "Release publication is incomplete: $updated" }
 
                 if (previousRepo == null || forceUpdate || updated != previousUpdateInfo) {
                     val data = versions
@@ -73,21 +72,16 @@ open class APIDataStoreImpl : APIDataStore {
         }
 
         // Updater checksums and publication must use the persisted catalogue, not the API projection.
-        fun loadUpdaterSnapshotWithInfo(dataStore: ApiPersistence, allowIncomplete: Boolean = false): Pair<AdoptRepos, UpdatedInfo> = runBlocking {
+        fun loadUpdaterSnapshotWithInfo(dataStore: ApiPersistence): Pair<AdoptRepos, UpdatedInfo> = runBlocking {
             val before = dataStore.getUpdatedAt()
-            check(allowIncomplete || !before.isIncomplete()) { "Release publication is incomplete: $before" }
             val snapshot = dataStore.readAllReleaseData()
             val after = dataStore.getUpdatedAt()
             check(before == after) { "Release generation changed while loading: $before -> $after" }
             Pair(snapshot, after)
         }
 
-        fun loadUpdaterSnapshot(dataStore: ApiPersistence, allowIncomplete: Boolean = false): AdoptRepos =
-            loadUpdaterSnapshotWithInfo(dataStore, allowIncomplete).first
-
-        // Recovery may use surviving records, but they must never enter the frontend cache.
-        fun loadRecoveryBaseline(dataStore: ApiPersistence): AdoptRepos =
-            loadUpdaterSnapshot(dataStore, allowIncomplete = true)
+        fun loadUpdaterSnapshot(dataStore: ApiPersistence): AdoptRepos =
+            loadUpdaterSnapshotWithInfo(dataStore).first
 
         fun loadCdxaDataFromDb(
             dataStore: ApiPersistence,
