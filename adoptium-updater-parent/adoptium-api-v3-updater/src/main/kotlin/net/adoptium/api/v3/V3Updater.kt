@@ -413,7 +413,12 @@ class V3Updater @Inject constructor(
             // On startup refresh the latest EA straight away, before any long full build.
             // An empty baseline (fresh database) would make it fetch all history, so go straight to the full build.
             if (!incrementalUpdateScheduled.get() && repo1.repos.isNotEmpty()) {
-                repo1 = incrementalUpdate(repo1) ?: repo1
+                try {
+                    repo1 = incrementalUpdate(repo1) ?: repo1
+                } catch (e: Exception) {
+                    // The early refresh is best effort; the full build below still runs
+                    LOGGER.error("Startup incremental update failed, continuing with the full update", e)
+                }
             }
         } finally {
             // An abandoned first attempt must not suppress later scheduled attempts

@@ -405,7 +405,8 @@ needed. Scheduled incrementals use `tryLock` and skip that cycle while a full
 build runs (they do not queue); the incremental that follows `fullUpdate(true)`
 in the same cycle waits for the lock. On startup an incremental runs first,
 before the full builds, so the latest EA is refreshed without waiting for a long
-full build. This is a single-updater, in-process guarantee, not a distributed
+full build. That startup incremental is best effort: a failure is logged and the full
+build still runs. This is a single-updater, in-process guarantee, not a distributed
 lock; a second concurrent updater is unsupported.
 Updater reads enumerate the persisted release collection rather
 than applying the frontend's version range.

@@ -153,4 +153,28 @@ class PublicationInvariantTest {
 
         assertEquals("build", order.first())
     }
+
+    @Test
+    fun `a failed startup incremental does not prevent the full build`() = runBlocking {
+        val before = repos(release("baseline", ReleaseType.ga))
+        val database = InMemoryApiPersistence(before, AdoptCdxaRepos(emptyList()))
+        val builder = mockk<AdoptReposBuilder>()
+        val updater = updater(builder, database)
+        var builds = 0
+        coEvery { builder.incrementalUpdate(any(), any(), any(), any()) } throws com.mongodb.MongoException("down")
+        coEvery { builder.build(any()) } coAnswers {
+            builds++
+            before
+        }
+        val executor = mockk<ScheduledExecutorService>()
+        every { executor.scheduleWithFixedDelay(any(), any(), any(), any()) } returns mockk(relaxed = true)
+
+        try {
+            updater.runUpdate(before, AtomicBoolean(false), executor)
+        } catch (e: com.mongodb.MongoException) {
+            // the incremental after the first full build may still fail
+        }
+
+        coVerify(atLeast = 1) { builder.build(any()) }
+    }
 }
