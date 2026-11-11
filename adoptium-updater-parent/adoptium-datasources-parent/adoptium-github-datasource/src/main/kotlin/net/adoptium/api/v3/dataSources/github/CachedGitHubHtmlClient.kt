@@ -40,6 +40,12 @@ interface GitHubHtmlClient {
     suspend fun getUrl(url: String): String?
 
     suspend fun getAsset(asset: GHAsset): String? = getUrl(asset.downloadUrl)
+
+    /**
+     * Like [getUrl], but guarantees the result is not older than [updatedAt] (the time the remote asset was
+     * last replaced), revalidating a cached copy synchronously if it was last checked before that time.
+     */
+    suspend fun getUrlUpdatedSince(url: String, updatedAt: ZonedDateTime?): String? = getUrl(url)
 }
 
 @ApplicationScoped
@@ -55,7 +61,9 @@ open class CachedGitHubHtmlClient @Inject constructor(
         val LAST_MODIFIED_PARSER = DateTimeFormatter.ofPattern("EEE, dd MMM yyyy HH:mm:ss zzz", Locale.US)!!
     }
 
-    private var backgroundHtmlDispatcher: ExecutorCoroutineDispatcher = Executors.newSingleThreadExecutor().asCoroutineDispatcher()
+    private var backgroundHtmlDispatcher: ExecutorCoroutineDispatcher = Executors.newSingleThreadExecutor {
+        Thread(it, "cached-github-html-client").apply { isDaemon = true }
+    }.asCoroutineDispatcher()
     private var refreshJob: Job
 
     // List of urls to be refreshed in the background
@@ -95,6 +103,33 @@ open class CachedGitHubHtmlClient @Inject constructor(
         }
         val cached = internalDbStore.getCachedWebpage(cacheKey)?.data
         return cached ?: get(UrlRequest(asset.downloadUrl), cacheKey, asset.digest, reuseCached = true)
+    }
+
+    override suspend fun getUrlUpdatedSince(url: String, updatedAt: ZonedDateTime?): String? {
+        val cachedEntry = internalDbStore.getCachedWebpage(url)
+        if (cachedEntry == null) {
+            return getUrl(url)
+        }
+
+        if (cachedEntry.data == null) {
+            // A null body is a failed fetch (404 or exhausted retries), not a valid cached response, so its
+            // lastChecked says nothing about freshness. Retry now, unconditionally (there is no body to validate).
+            return get(UrlRequest(url))
+        }
+
+        if (updatedAt == null) {
+            return getUrl(url)
+        }
+
+        val lastChecked = cachedEntry.lastChecked
+        if (lastChecked != null && !lastChecked.isBefore(updatedAt)) {
+            // Cached copy was validated after the asset was last updated
+            return getUrl(url)
+        }
+
+        // Asset changed since we last checked it, revalidate now rather than in the background.
+        // get() returns null on HTTP 304 (unchanged) or failure, in which case the cached body is still the best we have.
+        return get(UrlRequest(url, cachedEntry.lastModified)) ?: cachedEntry.data
     }
 
     private fun shouldUpdate(cachedEntry: CacheDbEntry): Boolean {

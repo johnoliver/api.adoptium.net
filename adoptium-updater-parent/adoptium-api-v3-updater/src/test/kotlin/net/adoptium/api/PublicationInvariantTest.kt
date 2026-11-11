@@ -37,7 +37,7 @@ class PublicationInvariantTest {
     private fun updater(builder: AdoptReposBuilder, database: InMemoryApiPersistence): V3Updater {
         val versions = mockk<UpdatableVersionSupplier>()
         coEvery { versions.updateVersions() } returns Unit
-        coEvery { builder.incrementalUpdate(any(), any(), any()) } answers { secondArg() }
+        coEvery { builder.incrementalUpdate(any(), any(), any(), any()) } answers { secondArg() }
         return V3Updater(builder, mockk(), APIDataStoreImpl(database), database,
             mockk(relaxed = true), mockk(relaxed = true), mockk(relaxed = true), versions)
     }

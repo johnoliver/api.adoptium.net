@@ -82,7 +82,7 @@ class UpdaterSnapshotTest {
         assertFalse(loaded.allReleases.hasReleaseId(GitHubId(hidden.id)))
         val builder = mockk<AdoptReposBuilder>()
         coEvery { builder.build(any()) } throws IllegalStateException("Unrelated full-build fetch failure")
-        coEvery { builder.incrementalUpdate(any(), any(), any()) } returns before
+        coEvery { builder.incrementalUpdate(any(), any(), any(), any()) } returns before
         val versions = mockk<UpdatableVersionSupplier>()
         coEvery { versions.updateVersions() } returns Unit
         val updater = V3Updater(builder, mockk(), store, database, mockk(), mockk(), mockk(), versions)

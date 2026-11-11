@@ -1,5 +1,6 @@
 package net.adoptium.api.v3.dataSources.persitence.mongo
 
+import com.mongodb.client.model.IndexOptions
 import com.mongodb.client.model.InsertManyOptions
 import com.mongodb.client.model.ReplaceOptions
 import com.mongodb.kotlin.client.coroutine.MongoCollection
@@ -67,7 +68,22 @@ open class MongoApiPersistence @Inject constructor(mongoClient: MongoClient) : M
     private val releaseInfoCollection: MongoCollection<ReleaseInfo> = createCollection(mongoClient.getDatabase(), RELEASE_INFO_DB)
     private val updateTimeCollection: MongoCollection<UpdatedInfo> = createCollection(mongoClient.getDatabase(), UPDATE_TIME_DB)
     private val cdxaUpdateTimeCollection: MongoCollection<UpdatedInfo> = createCollection(mongoClient.getDatabase(), CDXAS_UPDATE_TIME_DB)
-    private val githubReleaseNotesCollection: MongoCollection<ReleaseNotes> = createCollection(mongoClient.getDatabase(), GH_RELEASE_NOTES)
+    private val githubReleaseNotesCollection: MongoCollection<ReleaseNotes> = createCollection(
+        mongoClient.getDatabase(),
+        GH_RELEASE_NOTES,
+        ensureIndexes = { collection ->
+            try {
+                runBlocking {
+                    retryMongoOperation("create release notes id index") {
+                        collection.createIndex(Document("id", 1), IndexOptions().unique(true))
+                    }
+                }
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                LOGGER.warn("Failed to create index for releaseNotes: ${e.message}")
+            }
+        }
+    )
     private val client: MongoClient = mongoClient
     private val initialUpdateInfo = UpdatedInfo(TimeSource.now().minusMinutes(5), "000", 0)
 
@@ -359,10 +375,13 @@ open class MongoApiPersistence @Inject constructor(mongoClient: MongoClient) : M
     }
 
     override suspend fun putReleaseNote(releaseNotes: ReleaseNotes) {
-        retryMongoOperation("delete release notes") {
-            githubReleaseNotesCollection.deleteMany(Document("id", releaseNotes.id))
+        retryMongoOperation("replace release notes") {
+            githubReleaseNotesCollection.replaceOne(
+                Document("id", releaseNotes.id),
+                releaseNotes,
+                ReplaceOptions().upsert(true)
+            )
         }
-        githubReleaseNotesCollection.insertOne(releaseNotes)
     }
 
     override suspend fun getReleaseNotes(vendor: Vendor, releaseName: String): ReleaseNotes? {

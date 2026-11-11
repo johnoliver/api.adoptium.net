@@ -2,7 +2,7 @@
 
 Date: 2026-10-22
 
-Last reviewed: 2026-10-30
+Last reviewed: 2026-11-11
 
 ## Status
 
@@ -98,10 +98,11 @@ errors labelled `RetryableWriteError` qualify. Permanent or unclassified errors
 and coroutine cancellation propagate immediately. Failed read cursors restart
 with a fresh result rather than retaining partially collected rows.
 
-Append-only inserts, including release/CDXA batches, statistics and release
-notes, are not replayed by this policy: an acknowledgement failure can mean the
-write already succeeded. Nor are complete publications or delete/insert
-sequences retried. Existing MongoDB driver retry defaults remain unchanged;
+Append-only inserts, including release/CDXA batches and statistics, are not
+replayed by this policy: an acknowledgement failure can mean the write already
+succeeded. Release notes use upstream's atomic, ID-keyed replacement/upsert and
+therefore receive the repeat-safe retry budget. Complete publications and
+delete/insert sequences are not retried. Existing MongoDB driver retry defaults remain unchanged;
 three application attempts are not a limit on wire commands or elapsed time.
 
 A permanent failure or exhausted operation budget abandons the entire current
@@ -526,6 +527,26 @@ persisted retry state or historical-metadata state machine is required.
 An unchanged old EA that is not the latest is not guaranteed asset-only refreshes
 on every incremental cycle. It can still be selected by an explicit request,
 release edit, asset-count change or a full update's filters.
+
+## Upstream integration on 2026-11-11
+
+The merge from `origin/main` at `5a0e8251` preserves upstream's release-note and
+extended-version fixes alongside the invariants above:
+
+- The incremental callback receives only successfully refreshed releases,
+  including the latest-EA selection, even if mapped release data is unchanged.
+  Failed snapshots retain old splits without notifying the callback of success.
+- Release notes use the new ID-keyed upsert and unique index. Upserts and index
+  creation use bounded safe-operation retries; exhausted database failures escape
+  release-note isolation and abandon the scheduled update.
+- Release-note URL reads retain upstream's timestamp-based synchronous
+  revalidation and failed-cache-entry retry. Metadata/checksum assets keep their
+  separate ID/digest-aware cache keys, pending-fetch sharing and write ordering.
+- Version grouping and split identities retain upstream's patch and additional
+  version-number support rather than collapsing distinct metadata versions.
+
+The comparison below remains the recorded October baseline, not a comparison
+against the November merge target.
 
 ## Behaviour comparison with upstream/main
 

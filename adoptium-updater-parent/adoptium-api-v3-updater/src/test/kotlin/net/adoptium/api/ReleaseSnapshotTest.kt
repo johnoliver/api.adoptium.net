@@ -271,16 +271,21 @@ class ReleaseSnapshotTest {
         assertNull(failed.result)
         coEvery { repository.getReleaseById(complete.id) } returns failed
         val builder = AdoptReposBuilder(repository, versions())
-        val after = builder.incrementalUpdate(setOf(complete.name), before) { GHReleaseMetadata(999, it) }
+        val notifications = mutableListOf<List<Release>>()
+        val after = builder.incrementalUpdate(setOf(complete.name), before, onReleasesUpdated = { notifications.add(it) }) {
+            GHReleaseMetadata(999, it)
+        }
         assertEquals(nodes(before), nodes(after))
+        assertEquals(listOf(emptyList<Release>()), notifications)
         coVerify(exactly = 1) { repository.getReleaseById(complete.id) }
 
         coEvery { client.getUrl(sidecar) } returns metadata(2)
         val recovered = mapper.toAdoptRelease(complete)
         assertTrue(recovered.succeeded())
         coEvery { repository.getReleaseById(complete.id) } returns recovered
-        val retried = builder.incrementalUpdate(setOf(complete.name), after) { null }
+        val retried = builder.incrementalUpdate(setOf(complete.name), after, onReleasesUpdated = { notifications.add(it) }) { null }
         assertEquals(recovered.result!!.associateBy { it.id }, nodes(retried))
+        assertEquals(listOf(emptyList(), recovered.result), notifications)
         coVerify(exactly = 2) { repository.getReleaseById(complete.id) }
     }
 
@@ -335,10 +340,14 @@ class ReleaseSnapshotTest {
         val refreshed = mapper.toAdoptRelease(upstream(listOf(first, "$first.json"))).result!!
         coEvery { repository.getReleaseById(upstream.id) } returns ReleaseResult(refreshed)
         coEvery { repository.getReleaseById(GitHubId("upstream-other")) } returns ReleaseResult(error = "Network failure", retryable = true)
-        val after = AdoptReposBuilder(repository, versions()).incrementalUpdate(setOf(upstream.name), repos(previous + unrelated)) {
+        val notifications = mutableListOf<List<Release>>()
+        val after = AdoptReposBuilder(repository, versions()).incrementalUpdate(
+            setOf(upstream.name), repos(previous + unrelated), onReleasesUpdated = { notifications.add(it) }
+        ) {
             GHReleaseMetadata(999, it)
         }
         assertEquals((refreshed + unrelated).associateBy { it.id }, nodes(after))
+        assertEquals(listOf(refreshed), notifications)
         coVerify(exactly = 1) { repository.getReleaseById(upstream.id) }
     }
 
@@ -355,8 +364,12 @@ class ReleaseSnapshotTest {
             GHRepository(GHReleases(listOf(upstream, other), PageInfo(false, "")))
         )
         coEvery { repository.getReleaseById(upstream.id) } returns ReleaseResult(refreshed)
-        val after = AdoptReposBuilder(repository, versions()).incrementalUpdate(emptySet(), repos(previous)) { null }
+        val notifications = mutableListOf<List<Release>>()
+        val after = AdoptReposBuilder(repository, versions()).incrementalUpdate(
+            emptySet(), repos(previous), onReleasesUpdated = { notifications.add(it) }
+        ) { null }
         assertEquals((previous + refreshed).associateBy { it.id }, nodes(after))
+        assertEquals(listOf(refreshed), notifications)
         coVerify(exactly = 1) { repository.getReleaseById(upstream.id) }
         coVerify(exactly = 0) { repository.getReleaseById(other.id) }
     }

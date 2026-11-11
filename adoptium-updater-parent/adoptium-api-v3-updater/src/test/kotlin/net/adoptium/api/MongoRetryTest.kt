@@ -7,7 +7,6 @@ import com.mongodb.MongoSocketReadException
 import com.mongodb.MongoTimeoutException
 import com.mongodb.ServerAddress
 import com.mongodb.client.model.InsertManyOptions
-import com.mongodb.client.model.InsertOneOptions
 import com.mongodb.client.result.UpdateResult
 import com.mongodb.kotlin.client.coroutine.FindFlow
 import com.mongodb.kotlin.client.coroutine.MongoCollection
@@ -243,13 +242,31 @@ class MongoRetryTest {
     }
 
     @Test
-    fun `release note inserts are not retried after ambiguous completion`() = runBlocking {
+    fun `release note upserts retry without changing their replacement`() = runBlocking {
         val notes = collection<ReleaseNotes>(MongoApiPersistence.GH_RELEASE_NOTES)
-        val failure = transient("socket")
-        coEvery { notes.insertOne(any<ReleaseNotes>(), any<InsertOneOptions>()) } throws failure
+        val value = mockk<ReleaseNotes>(relaxed = true)
+        var attempts = 0
+        coEvery { notes.replaceOne(any<Bson>(), value, any()) } coAnswers {
+            if (++attempts < 3) throw transient("socket")
+            UpdateResult.acknowledged(1, 1, null)
+        }
 
-        assertSame(failure, runCatching { MongoApiPersistence(client).putReleaseNote(mockk(relaxed = true)) }.exceptionOrNull())
-        coVerify(exactly = 1) { notes.insertOne(any<ReleaseNotes>(), any<InsertOneOptions>()) }
+        MongoApiPersistence(client).putReleaseNote(value)
+
+        assertEquals(3, attempts)
+        coVerify(exactly = 3) { notes.replaceOne(any<Bson>(), value, any()) }
+        coVerify(exactly = 0) { notes.deleteMany(any<Bson>(), any()) }
+    }
+
+    @Test
+    fun `exhausted release note upserts propagate their database failure`() = runBlocking {
+        val notes = collection<ReleaseNotes>(MongoApiPersistence.GH_RELEASE_NOTES)
+        val value = mockk<ReleaseNotes>(relaxed = true)
+        val failure = transient("socket")
+        coEvery { notes.replaceOne(any<Bson>(), value, any()) } throws failure
+
+        assertSame(failure, runCatching { MongoApiPersistence(client).putReleaseNote(value) }.exceptionOrNull())
+        coVerify(exactly = 3) { notes.replaceOne(any<Bson>(), value, any()) }
     }
 
     @ParameterizedTest

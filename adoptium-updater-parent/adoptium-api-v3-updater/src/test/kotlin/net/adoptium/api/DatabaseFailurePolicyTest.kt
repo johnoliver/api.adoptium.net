@@ -54,7 +54,7 @@ class DatabaseFailurePolicyTest {
         val versions = mockk<UpdatableVersionSupplier>()
         coEvery { versions.updateVersions() } returns Unit
         coEvery { builder.build(any()) } returns before
-        coEvery { builder.incrementalUpdate(any(), any(),  any()) } answers { secondArg() }
+        coEvery { builder.incrementalUpdate(any(), any(), any(), any()) } answers { secondArg() }
         return V3Updater(builder, mockk(), APIDataStoreImpl(database), database, stats,
             mockk(relaxed = true), mockk(relaxed = true), versions)
     }
@@ -72,7 +72,7 @@ class DatabaseFailurePolicyTest {
         coVerify(exactly = 1) { database.readAllReleaseData() }
         coVerify(exactly = 0) {
             builder.build(any())
-            builder.incrementalUpdate(any(), any(), any())
+            builder.incrementalUpdate(any(), any(), any(), any())
             database.updateAllRepos(any(), any())
         }
 
@@ -101,7 +101,7 @@ class DatabaseFailurePolicyTest {
         })
         coVerify(exactly = 1) { builder.build(any()) }
         coVerify(exactly = 0) {
-            builder.incrementalUpdate(any(), any(), any())
+            builder.incrementalUpdate(any(), any(), any(), any())
             stats.update(any())
         }
         assertThrows(IllegalStateException::class.java) { APIDataStoreImpl.loadUpdaterSnapshot(database) }
@@ -127,7 +127,7 @@ class DatabaseFailurePolicyTest {
             builder.build(any())
             database.updateAllRepos(any(), any())
         }
-        coVerify(exactly = 0) { builder.incrementalUpdate(any(), any(), any()) }
+        coVerify(exactly = 0) { builder.incrementalUpdate(any(), any(), any(), any()) }
         assertFalse(database.getUpdatedAt().isIncomplete())
 
         coEvery { stats.update(any()) } returns Unit
@@ -144,12 +144,12 @@ class DatabaseFailurePolicyTest {
         every { executor.scheduleWithFixedDelay(capture(scheduled), any(), any(), any()) } returns mockk()
         updater.runUpdate(before, AtomicBoolean(false), executor)
 
-        coEvery { builder.incrementalUpdate(any(), any(), any()) } throws MongoException("Database unavailable")
+        coEvery { builder.incrementalUpdate(any(), any(), any(), any()) } throws MongoException("Database unavailable")
         scheduled.captured.run()
-        coEvery { builder.incrementalUpdate(any(), any(), any()) } returns before
+        coEvery { builder.incrementalUpdate(any(), any(), any(), any()) } returns before
         scheduled.captured.run()
 
-        coVerify(exactly = 3) { builder.incrementalUpdate(any(), any(), any()) }
+        coVerify(exactly = 3) { builder.incrementalUpdate(any(), any(), any(), any()) }
     }
 
     @Test

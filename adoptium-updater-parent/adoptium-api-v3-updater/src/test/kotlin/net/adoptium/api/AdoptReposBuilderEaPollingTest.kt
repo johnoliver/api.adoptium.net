@@ -323,11 +323,14 @@ class AdoptReposBuilderEaPollingTest {
             every { getAllVersions() } returns before.repos.keys.toTypedArray()
         })
 
-        val after = builder.incrementalUpdate(requested, before) {
+        val refreshed = mutableListOf<Release>()
+        val after = builder.incrementalUpdate(requested, before, onReleasesUpdated = { refreshed.addAll(it) }) {
             if (it.id == countChanged) GHReleaseMetadata(999, it) else null
         }
 
         assertEquals(repo(current), after)
+        assertEquals(expected, refreshed.map { it.id }.toSet())
+        assertEquals(expected.size, refreshed.size)
         coVerify(exactly = expected.size) { repository.getReleaseById(any()) }
         expected.forEach { id ->
             coVerify(exactly = 1) { repository.getReleaseById(GitHubId(id)) }

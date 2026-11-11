@@ -60,12 +60,13 @@ class AdoptReposBuilder @Inject constructor(
     suspend fun incrementalUpdate(
         toUpdate: Set<String>,
         repo: AdoptRepos,
+        onReleasesUpdated: suspend (List<Release>) -> Unit = {},
         gitHubMetadataSupplier: suspend (GitHubId) -> GHReleaseMetadata?,
     ): AdoptRepos {
         val versions = (repo.repos.keys + versionSupplier.getAllVersions())
             .associateWith { version -> repo.getFeatureRelease(version) ?: FeatureRelease(version, emptyList()) }
         val updated = versions
-            .map { entry -> getUpdatedFeatureRelease(toUpdate, entry, gitHubMetadataSupplier) }
+            .map { entry -> getUpdatedFeatureRelease(toUpdate, entry, onReleasesUpdated, gitHubMetadataSupplier) }
             // Probed versions with nothing mapped are not persisted, so keeping them would make
             // the in-memory checksum differ from what a reload returns.
             .filter { it.featureVersion in repo.repos || it.releases.nodes.isNotEmpty() }
@@ -76,6 +77,7 @@ class AdoptReposBuilder @Inject constructor(
     private suspend fun getUpdatedFeatureRelease(
         toUpdate: Set<String>,
         entry: Map.Entry<Int, FeatureRelease>,
+        onReleasesUpdated: suspend (List<Release>) -> Unit,
         gitHubMetadataSupplier: suspend (GitHubId) -> GHReleaseMetadata?,
     ): FeatureRelease {
         val summary = adoptRepository.getSummary(entry.key)
@@ -107,6 +109,8 @@ class AdoptReposBuilder @Inject constructor(
             summary, pruned, selectedRefreshes.flatMap { it.releases }, selectedSummaries.map { it.id }.toSet()
         )
         val refreshedIds = refreshes.map { it.id }.toSet()
+        val refreshedReleases = refreshes.flatMap { it.releases }
+        onReleasesUpdated(refreshedReleases)
 
         // A rolling release can acquire new version-based split IDs. Replace all
         // old snapshots of each refreshed GitHub release, not just matching split IDs.
@@ -117,7 +121,7 @@ class AdoptReposBuilder @Inject constructor(
                 pruned.releases.nodes.filterValues { GitHubId(it.id) !in refreshedIds }
             )
         )
-            .add(refreshes.flatMap { it.releases })
+            .add(refreshedReleases)
     }
 
     private fun getUpdatedReleases(summary: GHRepositorySummary, pruned: FeatureRelease): List<GHReleaseSummary> {
