@@ -14,7 +14,6 @@ import net.adoptium.api.v3.dataSources.UpdaterHtmlClient
 import net.adoptium.api.v3.dataSources.UpdaterJsonMapper
 import net.adoptium.api.v3.dataSources.github.graphql.models.HasRateLimit
 import org.slf4j.LoggerFactory
-import tools.jackson.databind.exc.MismatchedInputException
 import java.time.LocalDateTime
 import java.time.ZoneOffset
 import java.time.temporal.ChronoUnit
@@ -193,9 +192,6 @@ open class GraphQLGitHubInterface @Inject constructor(
                     throw Exception("Unexpected return type ${e.response.status}")
                 }
 
-            } catch (e: MismatchedInputException) {
-                LOGGER.info("MismatchedInputException: $e")
-                return null
             } catch (e: Exception) {
                 LOGGER.error("Query failed", e)
                 throw e

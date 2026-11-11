@@ -302,8 +302,9 @@ open class MongoApiPersistence @Inject constructor(mongoClient: MongoClient) : M
 
     // visible for testing
     open suspend fun updateUpdatedTime(dateTime: ZonedDateTime, checksum: String, hashCode: Int) {
+        val update = UpdatedInfo(dateTime, checksum, hashCode, generationId = UUID.randomUUID().toString())
         retryMongoOperation("replace release generation") {
-            updateTimeCollection.replaceOne(Document(), UpdatedInfo(dateTime, checksum, hashCode), ReplaceOptions().upsert(true))
+            updateTimeCollection.replaceOne(Document(), update, ReplaceOptions().upsert(true))
         }
         retryMongoOperation("delete obsolete release generations") {
             updateTimeCollection.deleteMany(Document("time", BsonDocument("\$lt", BsonDateTime(dateTime.toInstant().toEpochMilli()))))

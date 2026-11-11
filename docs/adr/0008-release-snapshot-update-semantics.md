@@ -134,7 +134,7 @@ do not expand that scope to make a regression pass.
 | --- | --- | --- |
 | I1 | Updater baselines include persisted releases and download attribution independently of API visibility filters or serving-version caps. | Updater snapshot loading: include a zero-binary release and a version above the frontend cap; exercise real MongoDB reads as well as an in-memory double. |
 | I2 | A replacement cannot silently discard newer published work within a feature version it replaces. | Build-to-publication handoff: publish an incremental change after the full-build baseline is captured, then attempt the stale full publication. |
-| I3 | A partial release-catalogue publication is never accepted as a committed generation. Recovery read failure cannot become an empty successful baseline. | Mongo publication and snapshot loading: fail invalidation, release writes, final publication, or recovery reads; repeat after restart. |
+| I3 | A partial release-catalogue publication is never accepted as a committed generation. Recovery read failure cannot become an empty successful baseline. | Mongo publication and snapshot loading: fail invalidation, release writes, final publication, or recovery reads; repeat after restart and republish identical content within the same second during a read. |
 | I4 | One upstream release is replaced as a complete set of splits, never a mixture of refreshed and stale binaries. Failures follow the update-mode policies below. | Mapping and builders: fail one required sidecar in a multi-binary release under both full and incremental updates, retaining explicit per-artifact checksum exclusions. |
 | I5 | Non-empty feature replacements remove obsolete releases; missing or empty features preserve stored records. Download-loss guards account for stored and rebuilt versions, including versions absent from the candidate. | Mongo persistence and the full-update guard: exercise absent, explicitly empty, and partially populated feature versions separately and assert download totals explicitly. |
 | I6 | Asset-list ordering cannot hide an available, unambiguous sidecar or change checksum decisions. | Sidecar selection: permute exact matches, ambiguous aliases and valid more-specific aliases. |
@@ -365,7 +365,15 @@ guarantee rollback of a database failure after publication has begun.
 Publication to MongoDB is not atomic, so the generation marker guards it. Before
 changing any release, a fresh `incomplete:<uuid>` marker replaces the published
 checksum; the target checksum is written only after every feature version has
-been processed. Only non-empty feature versions replace stored records; absent
+been processed. Every completed publication also persists a fresh `generationId`,
+separate from its content checksum and timestamp. Reader and full-build marker
+comparisons include this identity, so republishing unchanged content within the
+same second cannot hide an intervening delete/insert. Allocate the identity once
+per marker write and reuse it across that operation's bounded retries. Legacy
+records without this field retain a stable `null` identity until rewritten;
+reading an old record must not manufacture a new identity.
+
+Only non-empty feature versions replace stored records; absent
 and explicitly empty feature versions are left unchanged under the scope above. A
 failure therefore leaves a marker that matches neither the previous nor the
 target generation. Readers reject an incomplete marker, or a marker that changes
@@ -622,9 +630,11 @@ Additional implementation differences from this baseline are:
   demand write. The unused manual eviction API present upstream has been removed;
   production expiration in both versions relies on MongoDB's TTL index. These
   API differences do not change the shared thirty-day demand-retention policy.
-- GraphQL decoding mismatches are logged and returned as `null` by the query
-  helper, then rejected as missing page data by the paginated reader. Upstream
-  throws a decoding exception directly; neither path accepts a partial listing.
+- GraphQL decoding mismatches are logged and rethrown by the query helper,
+  matching upstream. Both paginated release reads and non-paginated CDXA
+  summaries abort rather than interpreting malformed data as missing records.
+  Valid missing-repository or missing-folder responses retain their existing
+  empty-result semantics; a decoding failure is not such a response.
 
 The checksum agreement and installer-metadata checks above are part of the
 implementation inspected, not pending follow-up work. They do not suppress the

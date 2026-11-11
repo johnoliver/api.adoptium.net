@@ -18,6 +18,7 @@ import net.adoptium.api.v3.models.Vendor
 import net.adoptium.api.v3.models.Cdxa
 import java.time.ZonedDateTime
 import java.time.temporal.ChronoUnit
+import java.util.UUID
 import jakarta.annotation.Priority
 import jakarta.enterprise.inject.Alternative
 import jakarta.inject.Inject
@@ -40,7 +41,7 @@ open class InMemoryApiPersistence @Inject constructor(var repos: AdoptRepos, var
 
     override suspend fun updateAllRepos(repos: AdoptRepos, checksum: String) {
         this.repos = repos
-        this.updatedAtInfo = UpdatedInfo(TimeSource.now(), checksum, repos.hashCode())
+        this.updatedAtInfo = UpdatedInfo(TimeSource.now(), checksum, repos.hashCode(), generationId = UUID.randomUUID().toString())
     }
 
     override suspend fun updateCdxaRepos(repos: AdoptCdxaRepos, checksum: String) {

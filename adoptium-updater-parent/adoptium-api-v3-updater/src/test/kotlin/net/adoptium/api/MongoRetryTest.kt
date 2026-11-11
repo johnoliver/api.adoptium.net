@@ -44,6 +44,7 @@ import net.adoptium.api.v3.models.Release
 import org.bson.BsonDocument
 import org.bson.conversions.Bson
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertNotNull
 import org.junit.jupiter.api.Assertions.assertSame
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
@@ -169,6 +170,22 @@ class MongoRetryTest {
         val error = runCatching { MongoApiPersistence(client).getUpdatedAt() }.exceptionOrNull()
         assertSame(failure, error)
         io.mockk.verify(exactly = 3) { generations.find(any<Bson>()) }
+    }
+
+    @Test
+    fun `generation upserts retry the same publication identity`() = runBlocking {
+        val generations = collection<UpdatedInfo>(MongoApiPersistence.UPDATE_TIME_DB)
+        val replacements = mutableListOf<UpdatedInfo>()
+        coEvery { generations.replaceOne(any<Bson>(), capture(replacements), any()) } coAnswers {
+            if (replacements.size < 3) throw transient("socket")
+            UpdateResult.acknowledged(1, 1, null)
+        }
+
+        MongoApiPersistence(client).updateUpdatedTime(TimeSource.now(), "published", 1)
+
+        assertEquals(3, replacements.size)
+        assertNotNull(replacements.first().generationId)
+        replacements.forEach { assertSame(replacements.first(), it) }
     }
 
     @Test

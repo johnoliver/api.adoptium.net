@@ -11,8 +11,10 @@ import net.adoptium.api.v3.dataSources.models.Releases
 import net.adoptium.api.v3.dataSources.APIDataStoreImpl
 import net.adoptium.api.v3.dataSources.models.ReleaseNote
 import net.adoptium.api.v3.dataSources.models.ReleaseNotes
+import net.adoptium.api.v3.dataSources.persitence.ApiPersistence
 import net.adoptium.api.v3.dataSources.persitence.mongo.MongoApiPersistence
 import net.adoptium.api.v3.dataSources.persitence.mongo.MongoClient
+import net.adoptium.api.v3.dataSources.persitence.mongo.UpdatedInfo
 import net.adoptium.api.v3.models.CloudflarePackageDownloadStatsDbEntry
 import net.adoptium.api.v3.models.GHReleaseMetadata
 import net.adoptium.api.v3.models.Release
@@ -30,6 +32,65 @@ import org.junit.jupiter.params.provider.ValueSource
 import java.time.ZonedDateTime
 
 class MongoAPIPersistenceTests : MongoTest() {
+
+    @ParameterizedTest
+    @ValueSource(strings = ["frontend", "updater", "recovery"])
+    fun `same-second identical republication invalidates an overlapping snapshot read`(reader: String): Unit = runBlocking {
+        val time = TimeSource.now()
+        val api = object : MongoApiPersistence(MongoClient()) {
+            override suspend fun updateUpdatedTime(dateTime: ZonedDateTime, checksum: String, hashCode: Int) {
+                super.updateUpdatedTime(time, checksum, hashCode)
+            }
+        }
+        val release = BaseTest.adoptRepos.getFeatureRelease(8)!!.releases.nodeList.first()
+        val repo = AdoptRepos(listOf(FeatureRelease(8, Releases(listOf(release)))))
+        val checksum = V3Updater.calculateChecksum(repo)
+        api.updateAllRepos(repo, checksum)
+        val before = api.getUpdatedAt()
+        val overlapping = object : ApiPersistence by api {
+            override suspend fun readReleaseData(featureVersion: Int): FeatureRelease {
+                api.updateAllRepos(repo, checksum)
+                return FeatureRelease(featureVersion, emptyList())
+            }
+
+            override suspend fun readAllReleaseData(): AdoptRepos {
+                api.updateAllRepos(repo, checksum)
+                return AdoptRepos(emptyList())
+            }
+        }
+
+        assertThrows(IllegalStateException::class.java) {
+            when (reader) {
+                "frontend" -> APIDataStoreImpl.loadDataFromDb(overlapping, before, true, repo, listOf(8), false)
+                "updater" -> APIDataStoreImpl.loadUpdaterSnapshot(overlapping)
+                else -> APIDataStoreImpl.loadRecoveryBaseline(overlapping)
+            }
+        }
+
+        val after = MongoApiPersistence(MongoClient()).getUpdatedAt()
+        assertEquals(time, before.time)
+        assertEquals(before.time, after.time)
+        assertEquals(before.checksum, after.checksum)
+        assertEquals(before.hashCode, after.hashCode)
+        assertNotEquals(before, after)
+        assertEquals(repo.getFeatureRelease(8)!!.releases.nodes,
+            APIDataStoreImpl.loadUpdaterSnapshot(api).getFeatureRelease(8)!!.releases.nodes)
+    }
+
+    @Test
+    fun `legacy generation records remain readable without inventing an identity`(): Unit = runBlocking {
+        val client = MongoClient()
+        val api = MongoApiPersistence(client)
+        val time = TimeSource.now()
+        api.updateUpdatedTime(time, "legacy", 7)
+        client.getDatabase().getCollection<Document>(MongoApiPersistence.UPDATE_TIME_DB)
+            .updateMany(Document(), Document("\$unset", Document("generationId", "")))
+
+        val restarted = MongoApiPersistence(MongoClient())
+        val expected = UpdatedInfo(time, "legacy", 7)
+        assertEquals(expected, restarted.getUpdatedAt())
+        assertEquals(expected, restarted.getUpdatedAt())
+    }
 
     @Test
     fun `raw updater snapshot loads all persisted feature versions and internal download counts`(): Unit = runBlocking {

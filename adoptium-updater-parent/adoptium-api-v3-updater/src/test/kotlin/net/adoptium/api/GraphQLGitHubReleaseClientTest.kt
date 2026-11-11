@@ -14,6 +14,7 @@ import kotlinx.coroutines.CancellationException
 import net.adoptium.api.v3.AdoptRepositoryImpl
 import net.adoptium.api.v3.AdoptRepository
 import net.adoptium.api.v3.AdoptReposBuilder
+import net.adoptium.api.v3.AdoptCdxaRepositoryImpl
 import net.adoptium.api.v3.V3Updater
 import net.adoptium.api.v3.ReleaseResult
 import net.adoptium.api.v3.TimeSource
@@ -35,6 +36,8 @@ import net.adoptium.api.v3.dataSources.github.graphql.clients.GraphQLRequest
 import net.adoptium.api.v3.dataSources.github.graphql.models.GHAsset
 import net.adoptium.api.v3.dataSources.github.graphql.models.GHAssetNode
 import net.adoptium.api.v3.dataSources.github.graphql.models.GHAssets
+import net.adoptium.api.v3.dataSources.github.graphql.models.GHCdxaRepoSummaryData
+import net.adoptium.api.v3.dataSources.github.graphql.models.GHCdxaRepoSummaryRepository
 import net.adoptium.api.v3.dataSources.github.graphql.models.GHRelease
 import net.adoptium.api.v3.dataSources.github.graphql.models.GHReleaseResult
 import net.adoptium.api.v3.dataSources.github.graphql.models.GHReleases
@@ -53,6 +56,7 @@ import net.adoptium.api.v3.dataSources.models.GitHubId
 import net.adoptium.api.v3.dataSources.models.AdoptRepos
 import net.adoptium.api.v3.dataSources.models.FeatureRelease
 import net.adoptium.api.v3.dataSources.models.Releases
+import net.adoptium.api.v3.dataSources.persitence.mongo.UpdatedInfo
 import net.adoptium.api.v3.mapping.ReleaseMapper
 import net.adoptium.api.v3.mapping.ReleaseMapper.Companion.parseDate
 import net.adoptium.api.v3.mapping.adopt.AdoptReleaseMapperFactory
@@ -62,6 +66,7 @@ import net.adoptium.api.v3.models.ReleaseType
 import net.adoptium.api.v3.models.Vendor
 import net.adoptium.api.v3.models.VersionData
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertSame
 import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.DynamicTest
@@ -304,7 +309,8 @@ class GraphQLGitHubReleaseClientTest : BaseTest() {
         }
         val client = GraphQLGitHubSummaryClient(graphQL)
 
-        assertThrows(IllegalStateException::class.java) {
+        val expected = if (failure.endsWith("-decode")) MismatchedInputException::class.java else IllegalStateException::class.java
+        assertThrows(expected) {
             runBlocking { client.getRepositorySummary("adoptium", "temurin8-binaries") }
         }
     }
@@ -332,7 +338,8 @@ class GraphQLGitHubReleaseClientTest : BaseTest() {
         }
         val client = GraphQLGitHubReleaseClient(graphQL, GraphQLGitHubReleaseRequest(graphQL))
 
-        assertThrows(IllegalStateException::class.java) {
+        val expected = if (failure == "decode") MismatchedInputException::class.java else IllegalStateException::class.java
+        assertThrows(expected) {
             runBlocking { client.getReleaseById(GitHubId("1")) }
         }
     }
@@ -673,6 +680,56 @@ class GraphQLGitHubReleaseClientTest : BaseTest() {
         assertEquals(emptyList<GHReleaseSummary>(), GraphQLGitHubSummaryClient(transport).getRepositorySummary("adoptium", "absent").releases.releases)
         assertEquals(emptyList<GHRelease>(), GraphQLGitHubRepositoryClient(transport, GraphQLGitHubReleaseRequest(transport))
             .getRepository("adoptium", "absent") { _, _ -> true }.releases.releases)
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = ["", "21"])
+    fun `CDXA summary decoding failures abort incremental replacement`(directory: String) = runBlocking {
+        val request = mockk<GraphQLRequest>()
+        val failure = MismatchedInputException.from(null, GHCdxaRepoSummaryData::class.java, "Invalid CDXA summary")
+        coEvery { request.request(any<GraphQLGitHubCdxaSummaryClient.RequestCdxaRepoSummary>()) } coAnswers {
+            val query = firstArg<GraphQLGitHubCdxaSummaryClient.RequestCdxaRepoSummary>()
+            if (query.directory == directory) throw failure
+            mockk<GraphQLClientResponse<GHCdxaRepoSummaryData>> {
+                every { data } returns GHCdxaSummaryTestDataGenerator.generateGHCdxaRepoSummary(adoptCdxaRepos, query.directory)
+                every { errors } returns null
+            }
+        }
+        val summaryClient = GraphQLGitHubCdxaSummaryClient(GraphQLGitHubInterface(request, mockkHttpClient()))
+        val client = mockk<GitHubApi>()
+        coEvery { client.getCdxaSummary(any(), any(), any()) } coAnswers {
+            summaryClient.getCdxaSummary(firstArg(), secondArg(), thirdArg())
+        }
+        val repository = AdoptCdxaRepositoryImpl(client, mockk(relaxed = true))
+        val previous = UpdatedInfo(TimeSource.now(), "previous", adoptCdxaRepos.hashCode())
+
+        val error = assertThrows(MismatchedInputException::class.java) {
+            runBlocking { repository.incrementalUpdate(adoptCdxaRepos, previous) }
+        }
+
+        assertSame(failure, error)
+        coVerify(exactly = 1) {
+            request.request(match<GraphQLGitHubCdxaSummaryClient.RequestCdxaRepoSummary> { it.directory == directory })
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = ["repository", "folder"])
+    fun `explicit absent CDXA repository or folder remains a valid response`(kind: String) = runBlocking {
+        val summaryData = if (kind == "repository") null else GHCdxaRepoSummaryData(
+            GHCdxaRepoSummaryRepository(null, null), RateLimit(0, 5000)
+        )
+        val response = mockk<GraphQLClientResponse<GHCdxaRepoSummaryData>> {
+            every { data } returns summaryData
+            every { errors } returns if (kind == "repository") {
+                listOf(mockk { every { message } returns "Could not resolve to a Repository" })
+            } else null
+        }
+        val request = mockk<GraphQLRequest>()
+        coEvery { request.request(any<GraphQLGitHubCdxaSummaryClient.RequestCdxaRepoSummary>()) } returns response
+        val client = GraphQLGitHubCdxaSummaryClient(GraphQLGitHubInterface(request, mockkHttpClient()))
+
+        assertEquals(summaryData, client.getCdxaSummary("adoptium", "temurin-cdxa", "missing"))
     }
 
     private fun setupFilterTest(): AdoptRepositoryImpl {

@@ -16,7 +16,8 @@ data class UpdatedInfo(
     val lastModifiedFormatted: String? = lastModified
         ?.toInstant()
         ?.atZone(ZoneId.of("GMT"))
-        ?.format(DateTimeFormatter.RFC_1123_DATE_TIME)) {
+        ?.format(DateTimeFormatter.RFC_1123_DATE_TIME),
+    val generationId: String? = null) {
 
     companion object {
         const val INCOMPLETE_PREFIX = "incomplete:"
