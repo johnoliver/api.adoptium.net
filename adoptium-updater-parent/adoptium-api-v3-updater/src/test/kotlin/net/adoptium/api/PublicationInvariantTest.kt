@@ -22,7 +22,13 @@ import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.params.ParameterizedTest
 import org.junit.jupiter.params.provider.EnumSource
+import io.mockk.every
+import io.mockk.slot
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 class PublicationInvariantTest {
     private fun release(id: String, type: ReleaseType, version: Int = 8, vendor: Vendor = Vendor.getDefault()): Release {
@@ -65,28 +71,6 @@ class PublicationInvariantTest {
         assertEquals(50L, database.repos.allReleases.nodes.getValue(preserved.id).download_count)
     }
 
-    @Test
-    fun `full publication reloads rather than overwriting a generation changed during its build`() = runBlocking {
-        val ga = release("baseline", ReleaseType.ga)
-        val added = release("incremental", ReleaseType.ea)
-        val before = repos(ga)
-        val concurrent = repos(ga, added)
-        val database = spyk(InMemoryApiPersistence(before, AdoptCdxaRepos(emptyList())))
-        val builder = mockk<AdoptReposBuilder>()
-        var builds = 0
-        coEvery { builder.build(any()) } coAnswers {
-            if (++builds != 1) error("Only the first full build is under test")
-            database.updateAllRepos(concurrent, V3Updater.calculateChecksum(concurrent))
-            before
-        }
-
-        val after = updater(builder, database).runUpdate(before, AtomicBoolean(true), mockk())
-
-        assertEquals(concurrent, database.repos)
-        assertEquals(concurrent, after)
-        coVerify(exactly = 1) { database.updateAllRepos(any(), any()) }
-    }
-
     @ParameterizedTest
     @EnumSource(value = ReleaseType::class, names = ["ga", "ea"])
     fun `guard checks a completely absent version and exempts only omitted EAs`(type: ReleaseType) = runBlocking {
@@ -106,5 +90,45 @@ class PublicationInvariantTest {
         assertEquals(expected, after)
         assertEquals(expected, database.repos)
         coVerify(exactly = if (type == ReleaseType.ga) 0 else 2) { database.updateAllRepos(any(), any()) }
+    }
+
+    @Test
+    fun `startup runs an incremental first and scheduled incrementals skip while a full build runs`() = runBlocking {
+        val before = repos(release("baseline", ReleaseType.ga))
+        val database = InMemoryApiPersistence(before, AdoptCdxaRepos(emptyList()))
+        val builder = mockk<AdoptReposBuilder>()
+        val order = java.util.Collections.synchronizedList(mutableListOf<String>())
+        val incrementals = AtomicInteger()
+        val buildStarted = CountDownLatch(1)
+        val releaseBuild = CountDownLatch(1)
+        val updater = updater(builder, database)
+        coEvery { builder.incrementalUpdate(any(), any(), any(), any()) } coAnswers {
+            incrementals.incrementAndGet()
+            order.add("incremental")
+            secondArg()
+        }
+        coEvery { builder.build(any()) } coAnswers {
+            order.add("build")
+            buildStarted.countDown()
+            check(releaseBuild.await(30, TimeUnit.SECONDS))
+            before
+        }
+        val scheduled = slot<Runnable>()
+        val executor = mockk<ScheduledExecutorService>()
+        every { executor.scheduleWithFixedDelay(capture(scheduled), any(), any(), any()) } returns mockk(relaxed = true)
+
+        val runner = Thread { updater.runUpdate(before, AtomicBoolean(false), executor) }
+        runner.start()
+        check(buildStarted.await(30, TimeUnit.SECONDS))
+        assertEquals(listOf("incremental", "build"), order.toList())
+
+        val incrementalsBefore = incrementals.get()
+        scheduled.captured.run()
+        assertEquals(incrementalsBefore, incrementals.get())
+
+        releaseBuild.countDown()
+        runner.join(30_000)
+        scheduled.captured.run()
+        assertEquals(incrementalsBefore + 2, incrementals.get())
     }
 }

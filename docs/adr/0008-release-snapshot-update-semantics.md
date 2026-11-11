@@ -134,7 +134,7 @@ do not expand that scope to make a regression pass.
 | ID | Invariant | Owning boundary and required scenario |
 | --- | --- | --- |
 | I1 | Updater baselines include persisted releases and download attribution independently of API visibility filters or serving-version caps. | Updater snapshot loading: include a zero-binary release and a version above the frontend cap; exercise real MongoDB reads as well as an in-memory double. |
-| I2 | A replacement cannot silently discard newer published work within a feature version it replaces. | Build-to-publication handoff: publish an incremental change after the full-build baseline is captured, then attempt the stale full publication. |
+| I2 | A replacement cannot silently discard newer published work within a feature version it replaces. | Mutual exclusion: a scheduled incremental is skipped while a full build holds the update lock (`PublicationInvariantTest`). |
 | I3 | The release database is usable at every point: a release is never removed before its replacement exists, and the generation advances only after all writes. A startup read failure cannot become an empty successful baseline. | Mongo publication and snapshot loading: reject release writes or the final publication and assert the previous catalogue stays readable; republish identical content within the same second during a read; republish without duplicates. |
 | I4 | One upstream release is replaced as a complete set of splits, never a mixture of refreshed and stale binaries. Failures follow the update-mode policies below. | Mapping and builders: fail one required sidecar in a multi-binary release under both full and incremental updates, retaining explicit per-artifact checksum exclusions. |
 | I5 | Non-empty feature replacements remove obsolete releases; missing or empty features preserve stored records. Download-loss guards account for stored and rebuilt versions, including versions absent from the candidate. | Mongo persistence and the full-update guard: exercise absent, explicitly empty, and partially populated feature versions separately and assert download totals explicitly. |
@@ -395,15 +395,19 @@ internal releases with no binaries retain their download counts even though the
 frontend hides them.
 
 Each full build captures one complete persisted baseline with its generation,
-instead of reusing the scheduler's startup catalogue. The preservation filter
-and statistics guard both use that same baseline. The existing publication
-mutex checks that the generation is unchanged before writing; if an incremental
-publication changed it during the build, discard the stale candidate and reload
-the current committed snapshot. This does not add another publication lock or
-retry queue. A discarded full build also skips that cycle's statistics update;
-the next daily cycle retries it. Repeated overlap with changed incremental
-publications is not expected (releases change rarely, and the build is
-bounded), so no incremental/full coordination is added. Updater reads enumerate the persisted release collection rather
+instead of reusing the scheduler's startup catalogue, read under the update
+lock so no incremental can change it during the build. The preservation filter
+and statistics guard both use that same baseline. Full and incremental release
+updates are mutually exclusive: both hold one in-process update lock for their
+whole run, so an incremental publication can never land between a full build's
+baseline read and its write, and no generation re-check or discard path is
+needed. Scheduled incrementals use `tryLock` and skip that cycle while a full
+build runs (they do not queue); the incremental that follows `fullUpdate(true)`
+in the same cycle waits for the lock. On startup an incremental runs first,
+before the full builds, so the latest EA is refreshed without waiting for a long
+full build. This is a single-updater, in-process guarantee, not a distributed
+lock; a second concurrent updater is unsupported.
+Updater reads enumerate the persisted release collection rather
 than applying the frontend's version range.
 This is the existing single-updater, in-process publication mutex, not a
 distributed compare-and-swap or a transaction across independent writers.
@@ -581,7 +585,7 @@ that these local changes are already present in the remote PR.
 | Installer metadata | Do not load installer metadata for validation; use its checksum sidecar for the installer checksum. | Load matching installer metadata through the asset-aware cache and include its SHA-256 in agreement checks. Missing metadata assets are allowed; listed metadata that cannot be read or parsed excludes only the installer, not its archive. |
 | Cache writes | Wait for completion-only jobs; their asynchronous write failure does not propagate through `join()`. | Await the result under a per-key lock, retaining ordering through cancellation. Permanent or exhausted cache-write failure fails the shared fetch and aborts the update. |
 | Updater baseline | Use the API's filtered, serving-version-limited projection for startup and checksum reconciliation. Full builds preserve from the supplied in-memory catalogue. | Read the entire persisted catalogue, including zero-binary accounting records. Each full build captures its own baseline and generation for both preservation and statistics. |
-| Publication and readers | Write the target generation in `finally`, even after failed release writes. Reader loads do not reject an incomplete or changing generation. | Upsert-then-delete release writes, commit the generation only after success, and reject changing reader snapshots. Discard a full candidate when its baseline generation changed during the build. |
+| Publication and readers | Write the target generation in `finally`, even after failed release writes. Reader loads do not reject an incomplete or changing generation. | Upsert-then-delete release writes, commit the generation only after success, and reject changing reader snapshots. Full and incremental updates hold one update lock, so a full build cannot be overtaken by an incremental publication. |
 | Database failures | Several release/optional-artifact boundaries can log and downgrade database failures. Failed full updates can continue into subsequent phases. | Retry known transient failures only at individual safe Mongo-operation boundaries, then propagate to the scheduler and stop the current attempt. Keep later scheduled attempts alive. |
 | Attestation generation | Advance the generation in `finally`, even after failed attestation writes. | Advance only after successful writes; do not replay ambiguous inserts. This does not add the release catalogue's upsert-then-delete ordering to CDXA. |
 | Known tag exclusions | Reject `jdk-11.0.13'+8` and `jdk17u-2022-05-27-19-32-beta` before mapping, including GA releases. | Filter successfully mapped EA results only. An empty filtered result removes old incremental splits; GA releases are not excluded by these rules. |

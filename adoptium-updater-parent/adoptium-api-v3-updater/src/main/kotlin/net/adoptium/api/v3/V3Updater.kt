@@ -36,6 +36,8 @@ import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 import kotlin.concurrent.timerTask
 
 @UnlessBuildProfile("test")
@@ -57,6 +59,9 @@ class V3Updater @Inject constructor(
 ) : Updater {
 
     private val mutex = Mutex()
+
+    // Full and incremental release updates never overlap: a full build holds this for its whole duration
+    private val updateLock = ReentrantLock(true)
     private val toUpdate: ConcurrentSkipListSet<String> = ConcurrentSkipListSet<String>()
 
     companion object {
@@ -117,7 +122,23 @@ class V3Updater @Inject constructor(
         return toUpdateList
     }
 
-    private fun incrementalUpdate(oldRepo: AdoptRepos): AdoptRepos? {
+    private fun incrementalUpdate(oldRepo: AdoptRepos): AdoptRepos? =
+        updateLock.withLock { incrementalUpdateLocked(oldRepo) }
+
+    // Scheduled incrementals skip rather than queue behind a running full build
+    private fun incrementalUpdateIfIdle(oldRepo: AdoptRepos): AdoptRepos? {
+        if (!updateLock.tryLock()) {
+            LOGGER.info("Skipping scheduled incremental update, another release update is in progress")
+            return null
+        }
+        try {
+            return incrementalUpdateLocked(oldRepo)
+        } finally {
+            updateLock.unlock()
+        }
+    }
+
+    private fun incrementalUpdateLocked(oldRepo: AdoptRepos): AdoptRepos? {
         return runBlocking {
             // Must catch errors or may kill the scheduler
             try {
@@ -353,7 +374,7 @@ class V3Updater @Inject constructor(
             throw e
         }
 
-        var cdxaRepo: AdoptCdxaRepos = try {
+        val cdxaRepo: AdoptCdxaRepos = try {
             apiDataStore.loadCdxaDataFromDb(true)
         } catch (e: java.lang.Exception) {
             LOGGER.error("Failed to load cdxa db", e)
@@ -389,19 +410,23 @@ class V3Updater @Inject constructor(
     ): AdoptRepos {
         var repo1 = repo
         try {
-            repo1 = fullUpdate(true) ?: repo1
-            repo1 = incrementalUpdate(repo1) ?: repo1
+            // On startup refresh the latest EA straight away, before any long full build
+            if (!incrementalUpdateScheduled.get()) {
+                repo1 = incrementalUpdate(repo1) ?: repo1
+            }
         } finally {
             // An abandoned first attempt must not suppress later scheduled attempts
             if (!incrementalUpdateScheduled.getAndSet(true)) {
                 executor.scheduleWithFixedDelay(
                     updateTask {
-                        repo1 = incrementalUpdate(repo1) ?: repo1
+                        repo1 = incrementalUpdateIfIdle(repo1) ?: repo1
                     },
                     1, 6, TimeUnit.MINUTES
                 )
             }
         }
+        repo1 = fullUpdate(true) ?: repo1
+        repo1 = incrementalUpdate(repo1) ?: repo1
         repo1 = fullUpdate(false) ?: repo1
         return repo1
     }
@@ -451,7 +476,11 @@ class V3Updater @Inject constructor(
     }
 
     @Throws(InvalidUpdateException::class)
-    private fun fullUpdate(releasesOnly: Boolean): AdoptRepos? {
+    private fun fullUpdate(releasesOnly: Boolean): AdoptRepos? =
+        updateLock.withLock { fullUpdateLocked(releasesOnly) }
+
+    @Throws(InvalidUpdateException::class)
+    private fun fullUpdateLocked(releasesOnly: Boolean): AdoptRepos? {
         // Must catch errors or may kill the scheduler
         try {
             return runBlocking {
@@ -459,9 +488,7 @@ class V3Updater @Inject constructor(
 
                 updatableVersionSupplier.updateVersions()
 
-                val (currentRepo, generation) = mutex.withLock {
-                    APIDataStoreImpl.loadUpdaterSnapshotWithInfo(database)
-                }
+                val currentRepo = APIDataStoreImpl.loadUpdaterSnapshot(database)
 
                 val filterType: ReleaseFilterType = if (releasesOnly) {
                     ReleaseFilterType.RELEASES_ONLY
@@ -480,10 +507,6 @@ class V3Updater @Inject constructor(
                 val checksum = calculateChecksum(repo)
 
                 val dataInDb = mutex.withLock {
-                    if (database.getUpdatedAt() != generation) {
-                        LOGGER.warn("Not applying full update because its persisted baseline changed during the build")
-                        return@runBlocking APIDataStoreImpl.loadUpdaterSnapshot(database)
-                    }
                     if (!validateStats(repo, currentRepo)) {
                         LOGGER.error("Stats do not look correct, not saving update")
                         throw InvalidUpdateException("Stats are not sane")

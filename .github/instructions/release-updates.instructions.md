@@ -16,8 +16,10 @@ contracts are repeated here rather than relying on loading the ADR.
   releases with their download counts. Frontend filtering and serving-version
   caps must not feed preservation, checksums or the full-update statistics guard.
 - I2: A full build uses one persisted baseline for preservation and statistics.
-  Under the existing publication mutex, discard its candidate if that baseline's
-  generation changed during the build. Do not overwrite newer incremental work.
+  Full and incremental updates are mutually exclusive via one in-process update
+  lock held for the whole run, so the baseline cannot change during a build and
+  no generation re-check is needed. Scheduled incrementals skip (not queue)
+  while a full build runs; startup runs an incremental before the full builds.
 - I3: The release database must be usable at every point. Upsert releases by id
   before deleting superseded ones; publish the target generation only after all
   release writes succeed. Readers reject changing generations. Failed startup

@@ -149,7 +149,7 @@ class DatabaseFailurePolicyTest {
         coEvery { builder.incrementalUpdate(any(), any(), any(), any()) } returns before
         scheduled.captured.run()
 
-        coVerify(exactly = 3) { builder.incrementalUpdate(any(), any(), any(), any()) }
+        coVerify(exactly = 4) { builder.incrementalUpdate(any(), any(), any(), any()) }
     }
 
     @Test
