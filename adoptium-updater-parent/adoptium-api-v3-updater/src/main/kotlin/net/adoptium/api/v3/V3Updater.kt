@@ -410,8 +410,9 @@ class V3Updater @Inject constructor(
     ): AdoptRepos {
         var repo1 = repo
         try {
-            // On startup refresh the latest EA straight away, before any long full build
-            if (!incrementalUpdateScheduled.get()) {
+            // On startup refresh the latest EA straight away, before any long full build.
+            // An empty baseline (fresh database) would make it fetch all history, so go straight to the full build.
+            if (!incrementalUpdateScheduled.get() && repo1.repos.isNotEmpty()) {
                 repo1 = incrementalUpdate(repo1) ?: repo1
             }
         } finally {

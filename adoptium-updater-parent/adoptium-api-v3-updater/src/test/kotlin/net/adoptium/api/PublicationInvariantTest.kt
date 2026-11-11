@@ -131,4 +131,26 @@ class PublicationInvariantTest {
         scheduled.captured.run()
         assertEquals(incrementalsBefore + 2, incrementals.get())
     }
+
+    @Test
+    fun `startup skips the early incremental when the baseline is empty`() = runBlocking {
+        val database = InMemoryApiPersistence(repos(), AdoptCdxaRepos(emptyList()))
+        val builder = mockk<AdoptReposBuilder>()
+        val updater = updater(builder, database)
+        val order = java.util.Collections.synchronizedList(mutableListOf<String>())
+        coEvery { builder.incrementalUpdate(any(), any(), any(), any()) } coAnswers {
+            order.add("incremental")
+            secondArg()
+        }
+        coEvery { builder.build(any()) } coAnswers {
+            order.add("build")
+            repos()
+        }
+        val executor = mockk<ScheduledExecutorService>()
+        every { executor.scheduleWithFixedDelay(any(), any(), any(), any()) } returns mockk(relaxed = true)
+
+        updater.runUpdate(repos(), AtomicBoolean(false), executor)
+
+        assertEquals("build", order.first())
+    }
 }
