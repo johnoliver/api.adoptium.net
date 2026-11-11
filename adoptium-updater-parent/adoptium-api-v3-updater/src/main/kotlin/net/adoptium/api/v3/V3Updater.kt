@@ -474,7 +474,7 @@ class V3Updater @Inject constructor(
                     APIDataStoreImpl.loadUpdaterSnapshotWithInfo(database, allowIncomplete = true)
                 }
 
-                val filterType: ReleaseFilterType = if (releasesOnly) {
+                val filterType: ReleaseFilterType = if (releasesOnly && !generation.isIncomplete()) {
                     ReleaseFilterType.RELEASES_ONLY
                 } else {
                     ReleaseFilterType.ALL
