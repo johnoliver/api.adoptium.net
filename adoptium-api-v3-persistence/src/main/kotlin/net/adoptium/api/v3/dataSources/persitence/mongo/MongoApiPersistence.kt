@@ -87,7 +87,9 @@ open class MongoApiPersistence @Inject constructor(mongoClient: MongoClient) : M
                     }
                 }
             } catch (e: Exception) {
-                if (e is CancellationException) throw e
+                if (e is CancellationException ||
+                    net.adoptium.api.v3.config.APIConfig.DEPLOYMENT_TYPE == net.adoptium.api.v3.config.DeploymentType.UPDATER
+                ) throw e
                 LOGGER.warn("Failed to create index for releases: ${e.message}")
             }
         }
