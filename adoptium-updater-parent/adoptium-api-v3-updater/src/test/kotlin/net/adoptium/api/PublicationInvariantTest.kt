@@ -19,11 +19,15 @@ import net.adoptium.api.v3.models.Release
 import net.adoptium.api.v3.models.ReleaseType
 import net.adoptium.api.v3.models.Vendor
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertSame
+import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.params.ParameterizedTest
 import org.junit.jupiter.params.provider.EnumSource
+import org.junit.jupiter.params.provider.ValueSource
 import io.mockk.every
 import io.mockk.slot
+import io.mockk.verify
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
@@ -154,27 +158,28 @@ class PublicationInvariantTest {
         assertEquals("build", order.first())
     }
 
-    @Test
-    fun `a failed startup incremental does not prevent the full build`() = runBlocking {
+    @ParameterizedTest
+    @ValueSource(booleans = [false, true])
+    fun `a failed startup incremental continues to the full build only for non-database failures`(database: Boolean) = runBlocking {
         val before = repos(release("baseline", ReleaseType.ga))
-        val database = InMemoryApiPersistence(before, AdoptCdxaRepos(emptyList()))
+        val persistence = InMemoryApiPersistence(before, AdoptCdxaRepos(emptyList()))
         val builder = mockk<AdoptReposBuilder>()
-        val updater = updater(builder, database)
-        var builds = 0
-        coEvery { builder.incrementalUpdate(any(), any(), any(), any()) } throws com.mongodb.MongoException("down")
-        coEvery { builder.build(any()) } coAnswers {
-            builds++
-            before
-        }
+        val updater = updater(builder, persistence)
+        val failure = if (database) com.mongodb.MongoException("down") else IllegalStateException("fetch failed")
+        coEvery { builder.incrementalUpdate(any(), any(), any(), any()) } throws failure
+        coEvery { builder.build(any()) } returns before
         val executor = mockk<ScheduledExecutorService>()
         every { executor.scheduleWithFixedDelay(any(), any(), any(), any()) } returns mockk(relaxed = true)
 
-        try {
+        if (database) {
+            assertSame(failure, assertThrows(com.mongodb.MongoException::class.java) {
+                updater.runUpdate(before, AtomicBoolean(false), executor)
+            })
+            coVerify(exactly = 0) { builder.build(any()) }
+        } else {
             updater.runUpdate(before, AtomicBoolean(false), executor)
-        } catch (e: com.mongodb.MongoException) {
-            // the incremental after the first full build may still fail
+            coVerify(exactly = 2) { builder.build(any()) }
         }
-
-        coVerify(atLeast = 1) { builder.build(any()) }
+        verify(exactly = 1) { executor.scheduleWithFixedDelay(any(), any(), any(), any()) }
     }
 }

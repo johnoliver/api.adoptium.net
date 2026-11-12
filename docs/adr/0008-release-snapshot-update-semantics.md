@@ -367,7 +367,11 @@ usable at every point; the database is never left in a state a starting frontend
 cannot load. For each non-empty feature version, every release is upserted by its
 `id` (idempotent, so bounded retries are safe), and only then are releases of that
 feature version whose ids are not in the new set deleted. A release is never
-removed before its replacement exists. The target checksum is written only after
+removed before its replacement exists. The release `id` index is unique; on
+startup, legacy duplicate copies of an id are reduced to one before the unique
+index is installed, and the next publication replaces that copy. Release checksums
+canonicalize feature and release key order, so persisted order cannot change them.
+The target checksum is written only after
 every feature version has been processed. A failure at any point leaves the
 previous generation marker with a catalogue made of complete, valid releases:
 the previous ones, plus any already-replaced or newly added ones, and possibly
@@ -405,8 +409,10 @@ needed. Scheduled incrementals use `tryLock` and skip that cycle while a full
 build runs (they do not queue); the incremental that follows `fullUpdate(true)`
 in the same cycle waits for the lock. On startup an incremental runs first,
 before the full builds, so the latest EA is refreshed without waiting for a long
-full build. That startup incremental is best effort: a failure is logged and the full
-build still runs. This is a single-updater, in-process guarantee, not a distributed
+full build. That startup incremental is best effort for ordinary fetch failures: they
+are logged and the full build still runs. A database failure abandons that attempt
+instead; future scheduled release and attestation incrementals are registered regardless.
+This is a single-updater, in-process guarantee, not a distributed
 lock; a second concurrent updater is unsupported.
 Updater reads enumerate the persisted release collection rather
 than applying the frontend's version range.

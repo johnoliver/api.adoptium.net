@@ -1,6 +1,7 @@
 package net.adoptium.api
 
 import com.mongodb.MongoBulkWriteException
+import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.runBlocking
 import net.adoptium.api.v3.TimeSource
 import net.adoptium.api.v3.V3Updater
@@ -84,6 +85,61 @@ class MongoAPIPersistenceTests : MongoTest() {
         api.updateAllRepos(AdoptRepos(listOf(FeatureRelease(8, Releases(listOf(kept, kept))))), "second")
 
         assertEquals(listOf(kept.id), api.readReleaseData(8).releases.nodeList.map { it.id })
+    }
+
+    @Test
+    fun `checksum of a reloaded snapshot does not depend on persisted release order`(): Unit = runBlocking {
+        val client = MongoClient()
+        val api = MongoApiPersistence(client)
+        client.getDatabase().getCollection<Document>(MongoApiPersistence.RELEASE_DB).deleteMany(Document())
+        val (first, second) = BaseTest.adoptRepos.getFeatureRelease(8)!!.releases.nodeList.take(2)
+        val other = BaseTest.adoptRepos.getFeatureRelease(11)!!.releases.nodeList.first()
+        val before = AdoptRepos(listOf(FeatureRelease(8, Releases(listOf(second)))))
+        api.updateAllRepos(before, V3Updater.calculateChecksum(before))
+        // The upsert appends the earlier release after the stored one, and features are out of order
+        val target = AdoptRepos(listOf(
+            FeatureRelease(11, Releases(listOf(other))), FeatureRelease(8, Releases(listOf(first, second)))
+        ))
+        val checksum = V3Updater.calculateChecksum(target)
+        api.updateAllRepos(target, checksum)
+
+        val reloaded = APIDataStoreImpl.loadUpdaterSnapshot(MongoApiPersistence(MongoClient()))
+        assertNotEquals(target.repos.keys.toList(), reloaded.repos.keys.toList())
+        assertNotEquals(
+            target.getFeatureRelease(8)!!.releases.nodes.keys.toList(),
+            reloaded.getFeatureRelease(8)!!.releases.nodes.keys.toList()
+        )
+        assertEquals(target, reloaded)
+        assertEquals(checksum, V3Updater.calculateChecksum(reloaded))
+        assertEquals(checksum, api.getUpdatedAt().checksum)
+    }
+
+    @Test
+    fun `conflicting persisted release copies are deduplicated before enforcing a unique id`(): Unit = runBlocking {
+        val client = MongoClient()
+        MongoApiPersistence(client)
+        val collection = client.getDatabase().getCollection<Document>(MongoApiPersistence.RELEASE_DB)
+        collection.deleteMany(Document())
+        val index = collection.listIndexes<Document>().toList().single { it["key"] == Document("id", 1) }
+        collection.dropIndex(index.getString("name"))
+        collection.createIndex(Document("id", 1))
+        val release = BaseTest.adoptRepos.getFeatureRelease(8)!!.releases.nodeList.first { it.binaries.isNotEmpty() }
+        val conflicting = Release(release, emptyArray())
+        client.getDatabase().getCollection<Release>(MongoApiPersistence.RELEASE_DB)
+            .insertMany(listOf(conflicting, release, conflicting))
+
+        val api = MongoApiPersistence(MongoClient())
+        assertEquals(1, collection.countDocuments(Document("id", release.id)))
+        assertTrue(collection.listIndexes<Document>().toList().single {
+            it["key"] == Document("id", 1)
+        }.getBoolean("unique"))
+        assertThrows(com.mongodb.MongoWriteException::class.java) {
+            runBlocking { client.getDatabase().getCollection<Release>(MongoApiPersistence.RELEASE_DB).insertOne(conflicting) }
+        }
+
+        val target = AdoptRepos(listOf(FeatureRelease(8, Releases(listOf(release)))))
+        api.updateAllRepos(target, V3Updater.calculateChecksum(target))
+        assertEquals(target, APIDataStoreImpl.loadUpdaterSnapshot(MongoApiPersistence(MongoClient())))
     }
 
     @Test

@@ -1,5 +1,6 @@
 package net.adoptium.api.v3.dataSources.persitence.mongo
 
+import com.mongodb.MongoCommandException
 import com.mongodb.client.model.BulkWriteOptions
 import com.mongodb.client.model.Filters
 import com.mongodb.client.model.IndexOptions
@@ -50,8 +51,39 @@ open class MongoApiPersistence @Inject constructor(mongoClient: MongoClient) : M
         ensureIndexes = { collection ->
             try {
                 runBlocking {
+                    val idIndex = retryMongoOperation("read release indexes") { collection.listIndexes<Document>().toList() }
+                        .singleOrNull { it["key"] == Document("id", 1) }
+                    if (idIndex?.getBoolean("unique", false) != true) {
+                        // Keep one copy of each duplicated release so the catalogue stays loadable;
+                        // the next publication replaces it.
+                        val duplicates = retryMongoOperation("read duplicate release ids") {
+                            collection.aggregate<Document>(listOf(
+                                Document("\$group", Document("_id", "\$id")
+                                    .append("keep", Document("\$max", "\$_id"))
+                                    .append("count", Document("\$sum", 1))),
+                                Document("\$match", Document("count", Document("\$gt", 1)))
+                            )).toList()
+                        }
+                        for (duplicate in duplicates) {
+                            val removed = retryMongoOperation("delete duplicate releases") {
+                                collection.deleteMany(Filters.and(
+                                    Filters.eq("id", duplicate["_id"]),
+                                    Filters.ne("_id", duplicate["keep"])
+                                )).deletedCount
+                            }
+                            LOGGER.warn("Removed {} duplicate copies of release {}", removed, duplicate["_id"])
+                        }
+                        if (idIndex != null) retryMongoOperation("drop nonunique release id index") {
+                            try {
+                                collection.dropIndex(idIndex.getString("name"))
+                            } catch (e: MongoCommandException) {
+                                // A retry after a lost acknowledgement finds the index already dropped
+                                if (e.errorCode != INDEX_NOT_FOUND) throw e
+                            }
+                        }
+                    }
                     retryMongoOperation("create release id index") {
-                        collection.createIndex(Document("id", 1))
+                        collection.createIndex(Document("id", 1), IndexOptions().unique(true))
                     }
                 }
             } catch (e: Exception) {
@@ -118,6 +150,7 @@ open class MongoApiPersistence @Inject constructor(mongoClient: MongoClient) : M
         const val RELEASE_INFO_DB = "releaseInfo"
         const val UPDATE_TIME_DB = "updateTime"
         const val GH_RELEASE_NOTES = "releaseNotes"
+        private const val INDEX_NOT_FOUND = 27
     }
 
     override suspend fun updateAllRepos(repos: AdoptRepos, checksum: String) {

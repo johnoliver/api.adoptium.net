@@ -10,6 +10,7 @@ import io.mockk.spyk
 import io.mockk.verify
 import kotlinx.coroutines.runBlocking
 import net.adoptium.api.testDoubles.InMemoryApiPersistence
+import net.adoptium.api.v3.AdoptCdxaReposBuilder
 import net.adoptium.api.v3.AdoptReposBuilder
 import net.adoptium.api.v3.AdoptRepository
 import net.adoptium.api.v3.AdoptRepositoryImpl
@@ -178,6 +179,32 @@ class DatabaseFailurePolicyTest {
 
         assertThrows(MongoException::class.java) { updater.runUpdate(before, AtomicBoolean(false), executor) }
 
+        verify(exactly = 1) { executor.scheduleWithFixedDelay(any(), any(), any(), any()) }
+    }
+
+    @Test
+    fun `first-cycle attestation database failure still registers the attestation task`() {
+        val database = InMemoryApiPersistence(before, AdoptCdxaRepos(emptyList()))
+        val versions = mockk<UpdatableVersionSupplier>()
+        coEvery { versions.updateVersions() } returns Unit
+        val cdxaBuilder = mockk<AdoptCdxaReposBuilder>()
+        val failure = MongoException("Database unavailable")
+        coEvery { cdxaBuilder.build() } throws failure
+        val updater = V3Updater(builder, cdxaBuilder, APIDataStoreImpl(database), database, stats,
+            mockk(relaxed = true), mockk(relaxed = true), versions)
+        val executor = mockk<ScheduledExecutorService>()
+        every { executor.scheduleWithFixedDelay(any(), any(), any(), any()) } returns mockk()
+        val scheduled = AtomicBoolean(false)
+
+        assertSame(failure, assertThrows(MongoException::class.java) {
+            updater.runCdxaUpdate(AdoptCdxaRepos(emptyList()), scheduled, executor)
+        })
+        coVerify(exactly = 0) { cdxaBuilder.incrementalUpdate(any(), any()) }
+        verify(exactly = 1) { executor.scheduleWithFixedDelay(any(), any(), any(), any()) }
+
+        assertThrows(MongoException::class.java) {
+            updater.runCdxaUpdate(AdoptCdxaRepos(emptyList()), scheduled, executor)
+        }
         verify(exactly = 1) { executor.scheduleWithFixedDelay(any(), any(), any(), any()) }
     }
 

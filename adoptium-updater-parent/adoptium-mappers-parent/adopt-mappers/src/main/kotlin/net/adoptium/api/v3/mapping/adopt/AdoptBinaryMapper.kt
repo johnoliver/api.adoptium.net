@@ -219,7 +219,7 @@ class AdoptBinaryMapper @Inject constructor(private val gitHubHtmlClient: GitHub
             val alias = fullAssetList.firstOrNull { it.name == name } ?: continue
             val competes = fullAssetList.any { other ->
                 other.name != binary_name &&
-                    BINARY_ASSET_WHITELIST.any { other.name.endsWith(it) } &&
+                    (BINARY_ASSET_WHITELIST.any { other.name.endsWith(it) } || isSupportedSbom(other)) &&
                     alias.name in sidecarAliases(other.name, suffix) &&
                     fullAssetList.none { it.name == "${other.name}$suffix" }
             }
@@ -227,6 +227,10 @@ class AdoptBinaryMapper @Inject constructor(private val gitHubHtmlClient: GitHub
         }
         return null
     }
+
+    // SBOM metadata sidecars (sbom-metadata.json) also match the SBOM name pattern but are not artifacts.
+    private fun isSupportedSbom(asset: GHAsset) =
+        asset.name.endsWith(".json") && !asset.name.endsWith("-metadata.json") && isSupportedBinaryAsset(asset)
 
     private fun removeExtensionFromName(binary_name: String): String {
         return BINARY_ASSET_WHITELIST.foldRight(binary_name) { extension, name -> name.removeSuffix(extension) }

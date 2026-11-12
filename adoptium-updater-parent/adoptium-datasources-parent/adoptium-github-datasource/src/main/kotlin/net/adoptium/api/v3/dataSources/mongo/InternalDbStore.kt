@@ -1,5 +1,6 @@
 package net.adoptium.api.v3.dataSources.mongo
 
+import com.mongodb.MongoCommandException
 import com.mongodb.client.model.IndexOptions
 import com.mongodb.client.model.FindOneAndUpdateOptions
 import com.mongodb.client.model.UpdateOptions
@@ -36,6 +37,10 @@ interface InternalDbStore {
 
 @ApplicationScoped
 open class InternalDbStoreImpl @Inject constructor(mongoClient: MongoClient) : MongoInterface(), InternalDbStore {
+    private companion object {
+        const val INDEX_NOT_FOUND = 27
+    }
+
     private val webCache: MongoCollection<CacheDbEntry> = createCollection(mongoClient.getDatabase(), "web-cache")
 
     init {
@@ -58,7 +63,12 @@ open class InternalDbStoreImpl @Inject constructor(mongoClient: MongoClient) : M
                         .warn("Invalidated {} duplicate cache entries for {}", removed, duplicate["_id"])
                 }
                 if (urlIndex != null) retryMongoOperation("drop nonunique cache index") {
-                    webCache.dropIndex(urlIndex.getString("name"))
+                    try {
+                        webCache.dropIndex(urlIndex.getString("name"))
+                    } catch (e: MongoCommandException) {
+                        // A retry after a lost acknowledgement finds the index already dropped
+                        if (e.errorCode != INDEX_NOT_FOUND) throw e
+                    }
                 }
             }
             retryMongoOperation("create unique cache index") {

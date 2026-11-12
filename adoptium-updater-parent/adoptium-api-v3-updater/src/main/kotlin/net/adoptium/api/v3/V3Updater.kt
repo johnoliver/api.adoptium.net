@@ -19,7 +19,9 @@ import net.adoptium.api.v3.dataSources.UpdatableVersionSupplier
 import net.adoptium.api.v3.dataSources.UpdaterJsonMapper
 import net.adoptium.api.v3.dataSources.models.AdoptRepos
 import net.adoptium.api.v3.dataSources.models.AdoptCdxaRepos
+import net.adoptium.api.v3.dataSources.models.FeatureRelease
 import net.adoptium.api.v3.dataSources.models.GitHubId
+import net.adoptium.api.v3.dataSources.models.Releases
 import net.adoptium.api.v3.dataSources.persitence.ApiPersistence
 import net.adoptium.api.v3.models.Release
 import net.adoptium.api.v3.models.ReleaseType
@@ -75,7 +77,11 @@ class V3Updater @Inject constructor(
                     md.update(b.toByte())
                 }
             }
-            UpdaterJsonMapper.mapper.writeValue(outputStream, repo)
+            // Map order depends on how the snapshot was assembled (e.g. Mongo cursor order), not its content
+            val canonical = AdoptRepos(repo.repos.toSortedMap().mapValues { (_, feature) ->
+                FeatureRelease(feature.featureVersion, Releases(feature.releases.nodes.toSortedMap()))
+            })
+            UpdaterJsonMapper.mapper.writeValue(outputStream, canonical)
 
             return String(Base64.getEncoder().encode(md.digest()))
         }
@@ -393,7 +399,13 @@ class V3Updater @Inject constructor(
         executor.scheduleWithFixedDelay(
             updateTask {
                 try {
-                    repo = runUpdate(repo, incrementalUpdateScheduled, executor)
+                    repo = try {
+                        runUpdate(repo, incrementalUpdateScheduled, executor)
+                    } catch (e: Throwable) {
+                        // Abandon this attempt's database work, but keep future attestation attempts alive
+                        scheduleIncrementalCdxaUpdates(cdxaRepo, incrementalCdxaUpdateScheduled, executor)
+                        throw e
+                    }
                     runCdxaUpdate(cdxaRepo, incrementalCdxaUpdateScheduled, executor)
                 } catch (e: InvalidUpdateException) {
                     LOGGER.error("Failed to perform update", e)
@@ -416,7 +428,9 @@ class V3Updater @Inject constructor(
                 try {
                     repo1 = incrementalUpdate(repo1) ?: repo1
                 } catch (e: Exception) {
-                    // The early refresh is best effort; the full build below still runs
+                    // A database failure abandons this attempt; future incrementals are still registered below
+                    if (e is MongoException) throw e
+                    // The early refresh is otherwise best effort; the full build below still runs
                     LOGGER.error("Startup incremental update failed, continuing with the full update", e)
                 }
             }
@@ -443,9 +457,23 @@ class V3Updater @Inject constructor(
         executor: ScheduledExecutorService
     ): AdoptCdxaRepos {
         var repo1 = repo
-        repo1 = fullCdxaUpdate(repo1) ?: repo1
-        repo1 = incrementalCdxaUpdate(repo1) ?: repo1
+        try {
+            repo1 = fullCdxaUpdate(repo1) ?: repo1
+            repo1 = incrementalCdxaUpdate(repo1) ?: repo1
+        } finally {
+            // An abandoned attempt must not suppress later scheduled attempts
+            scheduleIncrementalCdxaUpdates(repo1, incrementalCdxaUpdateScheduled, executor)
+        }
+        return repo1
+    }
+
+    private fun scheduleIncrementalCdxaUpdates(
+        repo: AdoptCdxaRepos,
+        incrementalCdxaUpdateScheduled: AtomicBoolean,
+        executor: ScheduledExecutorService
+    ) {
         if (!incrementalCdxaUpdateScheduled.getAndSet(true)) {
+            var repo1 = repo
             executor.scheduleWithFixedDelay(
                 updateTask {
                     repo1 = incrementalCdxaUpdate(repo1) ?: repo1
@@ -453,7 +481,6 @@ class V3Updater @Inject constructor(
                 1, 6, TimeUnit.MINUTES
             )
         }
-        return repo1
     }
 
     private fun updateTask(update: () -> Unit) = timerTask {

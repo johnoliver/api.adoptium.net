@@ -282,6 +282,25 @@ class AdoptBinaryMapperTest {
     }
 
     @Test
+    fun `shared checksum alias is ambiguous for SBOMs but not their metadata sidecars`() {
+        runBlocking {
+            coEvery { fakeGithubHtmlClient.getAsset(any()) } returns null
+            val stem = "OpenJDK21U-sbom_x64_linux_hotspot_21"
+            fun asset(name: String, link: String = "") = GHAsset(name, 1L, link, 1L, "2013-02-27T19:35:32Z")
+            val shared = asset("$stem.sha256.txt", "shared-link")
+            val sbom = asset("$stem.0.1_12.json")
+
+            val ambiguous = listOf(sbom, asset("$stem.0.2_13.json"), shared)
+            val binaries = adoptBinaryMapper.toBinaryList(listOf(sbom), ambiguous, emptyMap())
+            assertEquals(null, binaries.single().`package`.checksum_link)
+
+            val withSidecar = listOf(sbom, asset("$stem.0.1_12-metadata.json"), shared)
+            val mapped = adoptBinaryMapper.toBinaryList(listOf(sbom), withSidecar, emptyMap())
+            assertEquals("shared-link", mapped.single().`package`.checksum_link)
+        }
+    }
+
+    @Test
     fun `parses old OpenJ9`() {
         runBlocking {
             val assets = listOf(
